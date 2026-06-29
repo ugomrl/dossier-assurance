@@ -14,10 +14,9 @@ Réécriture complète (architecture senior) :
 
 import io
 import re
-import os
 import json
-import uuid
-import tempfile
+import gzip
+import base64
 import datetime
 import unicodedata
 import traceback
@@ -456,18 +455,17 @@ def clear_all_lines():
 
 
 # ============================================================================
-# 6. PERSISTANCE (mémoire) — survit refresh / retour arrière
+# 6. PERSISTANCE (mémoire) — tout l'état vit dans l'URL (?d=…)
 # ============================================================================
-_SESS_DIR = os.path.join(tempfile.gettempdir(), "dossier_assurance_sessions")
-os.makedirs(_SESS_DIR, exist_ok=True)
+# Choix d'architecture : sur Streamlit Cloud le disque est éphémère (instance
+# recyclée, parfois plusieurs workers) → un fichier serveur n'est PAS fiable.
+# On encode donc l'intégralité de l'état (admin + lignes) dans un paramètre
+# d'URL compressé. Conséquence : la sauvegarde survit au rafraîchissement, au
+# bouton « retour » du navigateur ET au recyclage de l'instance. L'URL devient
+# un véritable signet du dossier.
 _PERSIST_KEYS = (list(PLACEHOLDERS.keys())
                  + ["zone_select", "expert_ht", "target_margin", "nav_step",
                     "pdf_parsed", "pdf_applied"])
-
-
-def _session_path(sid):
-    safe = re.sub(r"[^A-Za-z0-9]", "", sid)[:40]
-    return os.path.join(_SESS_DIR, f"{safe}.json")
 
 
 def _build_snapshot():
@@ -485,23 +483,7 @@ def _build_snapshot():
     return data
 
 
-def save_session(sid):
-    try:
-        with open(_session_path(sid), "w", encoding="utf-8") as f:
-            json.dump(_build_snapshot(), f, ensure_ascii=False)
-    except Exception:
-        pass
-
-
-def restore_session(sid):
-    path = _session_path(sid)
-    if not os.path.exists(path):
-        return False
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return False
+def _apply_snapshot(data):
     for k in _PERSIST_KEYS:
         if k in data and data[k] is not None:
             st.session_state[k] = data[k]
@@ -512,19 +494,39 @@ def restore_session(sid):
         st.session_state.line_counter = data["line_counter"]
     for key, val in (data.get("lines") or {}).items():
         st.session_state[key] = val
-    return True
 
 
-_sid = st.query_params.get("sid")
-if not _sid:
-    _sid = uuid.uuid4().hex[:12]
-    st.query_params["sid"] = _sid
-st.session_state["_sid"] = _sid
+def _encode_state():
+    raw = json.dumps(_build_snapshot(), ensure_ascii=False).encode("utf-8")
+    return base64.urlsafe_b64encode(gzip.compress(raw, 6)).decode("ascii")
 
+
+def _decode_state(blob):
+    raw = gzip.decompress(base64.urlsafe_b64decode(blob.encode("ascii")))
+    return json.loads(raw.decode("utf-8"))
+
+
+def persist_state():
+    """Écrit l'état courant dans l'URL — seulement s'il a changé (anti-boucle)."""
+    try:
+        blob = _encode_state()
+        if st.query_params.get("d") != blob:
+            st.query_params["d"] = blob
+    except Exception:
+        pass
+
+
+# Hydratation : une seule fois par session Streamlit (donc rejouée à chaque
+# rafraîchissement, qui recrée une session côté serveur).
 if not st.session_state.get("_hydrated"):
     st.session_state["_hydrated"] = True
-    if restore_session(_sid):
-        st.session_state.seeded = True
+    _blob = st.query_params.get("d")
+    if _blob:
+        try:
+            _apply_snapshot(_decode_state(_blob))
+            st.session_state.seeded = True
+        except Exception:
+            pass
 
 # Première visite : une ligne vierge pour montrer la structure.
 if "seeded" not in st.session_state:
@@ -856,15 +858,17 @@ STEPS = ["Étape 1 · Import / Admin", "Étape 2 · Chiffrage par lots", "Étape
 STEP_TITLES = ["Import / Admin", "Chiffrage par lots", "Génération & Dashboard"]
 
 
-def render_breadcrumb(active_index):
+def render_stepper(active_index):
+    """Stepper CLIQUABLE : un clic sur une étape y navigue directement."""
     pct = int((active_index + 1) / len(STEPS) * 100)
-    st.markdown(f"<div class='tech-progress'><span style='width:{pct}%'></span></div>", unsafe_allow_html=True)
-    items = ""
-    for i, title in enumerate(STEP_TITLES):
-        cls = "crumb active" if i == active_index else ("crumb done" if i < active_index else "crumb")
+    st.markdown(f"<div class='tech-progress'><span style='width:{pct}%'></span></div>",
+                unsafe_allow_html=True)
+    cols = st.columns(len(STEPS))
+    for i, (col, title) in enumerate(zip(cols, STEP_TITLES)):
         mark = "✓" if i < active_index else str(i + 1)
-        items += f"<div class='{cls}'><span class='n'>{mark}</span><span class='t'>{title}</span></div>"
-    st.markdown(f"<div class='crumbs'>{items}</div>", unsafe_allow_html=True)
+        col.button(f"{mark}  {title}", key=f"step_{i}", width="stretch",
+                   type=("primary" if i == active_index else "secondary"),
+                   on_click=cb_goto, args=(STEPS[i],))
 
 
 def render_nav_buttons(active_index):
@@ -1139,7 +1143,7 @@ scroll_to_top_if_needed()
 if st.session_state["nav_step"] not in STEPS:
     st.session_state["nav_step"] = STEPS[0]
 active_index = STEPS.index(st.session_state["nav_step"])
-render_breadcrumb(active_index)
+render_stepper(active_index)
 
 if active_index == 0:
     render_step1()
@@ -1149,4 +1153,7 @@ else:
     render_step3()
 
 render_nav_buttons(active_index)
-save_session(st.session_state["_sid"])
+
+# Sauvegarde automatique dans l'URL à la fin de CHAQUE exécution : à ce stade,
+# toutes les saisies de la passe courante sont déjà dans st.session_state.
+persist_state()
