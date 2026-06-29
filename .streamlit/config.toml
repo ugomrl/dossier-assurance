@@ -1,0 +1,16 @@
+# ============================================================================
+#  Thème Streamlit — verrouille un rendu CLAIR et lisible
+#  À placer dans :  <votre_projet>/.streamlit/config.toml
+#  (le dossier .streamlit doit être au même niveau que app.py)
+# ============================================================================
+[theme]
+base = "light"                       # Force le mode clair, même si l'OS est en sombre
+primaryColor = "#1A365D"             # Bleu marine (boutons primaires, accents)
+backgroundColor = "#FFFFFF"          # Fond principal
+secondaryBackgroundColor = "#F4F6F9" # Fond des cartes / sidebar
+textColor = "#1F2933"                # Encre foncée : contraste garanti
+font = "sans serif"
+
+[server]
+# Confort de développement : recharge auto à chaque sauvegarde du fichier
+runOnSave = true
