@@ -23,6 +23,7 @@ import re
 import datetime
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 # Dépendances PDF (génération + extraction)
 from reportlab.lib.pagesizes import A4
@@ -265,11 +266,28 @@ def validate_siret(siret):
     return len(re.sub(r"\D", "", str(siret))) == 14
 
 
+def _parse_amount(raw):
+    """Convertit '7 500,00' ou '7.500,00' ou '7500.00' en float. None si invalide."""
+    s = re.sub(r"[^\d,.\s]", "", raw).strip()
+    s = s.replace(" ", "")
+    # Si la virgule est le séparateur décimal (format FR) : retirer les points
+    # de milliers puis transformer la virgule en point.
+    if "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
 def extract_data_from_pdf(pdf_file):
     """
-    Pré-remplissage automatique : tente d'extraire n° de sinistre, cabinet
-    d'expertise et montant plafond depuis le rapport PDF déposé.
-    Tolérant aux erreurs : retourne simplement ce qu'il trouve.
+    Pré-remplissage automatique : lit le rapport d'expertise (PDF) et tente
+    d'en extraire un maximum de champs (n° sinistre, compagnie, expert,
+    référence, assuré, adresse, plafond HT).
+    Tolérant : retourne uniquement ce qui a pu être trouvé avec confiance.
+    Chaque libellé ci-dessous accepte de nombreuses variantes rencontrées dans
+    les rapports réels (« N° de sinistre », « Réf. dossier », « Cabinet », …).
     """
     found = {}
     if not PDFPLUMBER_OK:
@@ -277,28 +295,88 @@ def extract_data_from_pdf(pdf_file):
     try:
         with pdfplumber.open(pdf_file) as pdf:
             text = "\n".join(p.extract_text() or "" for p in pdf.pages)
-
-        m = re.search(r"(?i)(?:sinistre|réf|dossier)[\s:]*([A-Z0-9\-]{6,15})", text)
-        if m:
-            found["claim_number"] = m.group(1)
-
-        m = re.search(r"(?i)(?:expert|cabinet)[\s:]*([A-Za-zÀ-ÿ\s]{5,30})", text)
-        if m:
-            found["expert_name"] = m.group(1).strip()
-
-        m = re.search(r"(?i)total\s*HT[\s:]*([\d\s]+[.,]\d{2})", text)
-        if m:
-            found["expert_ht"] = float(m.group(1).replace(" ", "").replace(",", "."))
     except Exception as exc:
-        st.warning(f"Lecture du PDF partielle : {exc}")
+        st.warning(f"Lecture du PDF impossible : {exc}")
+        return found
+
+    # Normalisation légère pour fiabiliser les expressions régulières
+    text = text.replace("\xa0", " ")
+
+    def grab(patterns, group=1):
+        """Renvoie la 1re capture non vide parmi une liste de motifs."""
+        for pat in patterns:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m and m.group(group).strip():
+                return m.group(group).strip()
+        return None
+
+    # --- N° de sinistre / dossier (alphanumérique avec tirets) ---
+    claim = grab([
+        r"(?:n[°o]\s*(?:de\s*)?sinistre|sinistre\s*n[°o]?)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-/]{4,20})",
+        r"(?:r[ée]f(?:[ée]rence)?\.?\s*(?:dossier)?|dossier)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-/]{4,20})",
+    ])
+    if claim:
+        found["claim_number"] = claim
+
+    # --- Référence du rapport d'expertise ---
+    ref = grab([
+        r"(?:r[ée]f\.?\s*(?:expert|rapport)|n[°o]\s*rapport)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-/]{3,20})",
+    ])
+    if ref:
+        found["expert_ref"] = ref
+
+    # --- Cabinet d'expertise (séparateur obligatoire pour éviter « EXPERTISE ») ---
+    expert = grab([
+        r"(?:cabinet|expert(?:\s*missionn[ée])?)\b\s*[:\-]\s*([A-Za-zÀ-ÿ0-9'’&\.\- ]{4,40})",
+    ])
+    if expert:
+        # On coupe à un éventuel saut de ligne capturé
+        found["expert_name"] = re.split(r"\s{2,}|\n", expert)[0].strip()
+
+    # --- Compagnie d'assurance ---
+    insurer = grab([
+        r"(?:compagnie|assureur|assurance)\b\s*[:\-]\s*([A-Za-zÀ-ÿ0-9'’&\.\- ]{3,40})",
+    ])
+    if insurer:
+        found["insurance_name"] = re.split(r"\s{2,}|\n", insurer)[0].strip()
+
+    # --- Assuré ---
+    client = grab([
+        r"(?:assur[ée]|client|b[ée]n[ée]ficiaire)\b\s*[:\-]\s*([A-Za-zÀ-ÿ0-9'’&\.\- ]{3,40})",
+    ])
+    if client:
+        found["client_name"] = re.split(r"\s{2,}|\n", client)[0].strip()
+
+    # --- Adresse du chantier / du bien ---
+    address = grab([
+        r"(?:adresse\s*(?:du\s*(?:chantier|bien|sinistre))?|lieu\s*du\s*sinistre)\s*[:\-]?\s*"
+        r"([0-9].{6,60}?\d{5}\s+[A-Za-zÀ-ÿ\- ]{2,30})",
+    ])
+    if address:
+        found["address"] = re.split(r"\n", address)[0].strip()
+
+    # --- Plafond / montant HT estimé par l'expert ---
+    raw_amount = grab([
+        r"(?:total|montant|estimation|plafond)\s*(?:g[ée]n[ée]ral\s*)?HT\s*[:\-]?\s*"
+        r"([\d][\d\s. ]*[.,]\d{2})",
+        r"HT\s*[:\-]?\s*([\d][\d\s. ]*[.,]\d{2})\s*€?",
+    ])
+    if raw_amount:
+        amount = _parse_amount(raw_amount)
+        if amount and amount > 0:
+            found["expert_ht"] = amount
+
     return found
 
 
 # ============================================================================
 # 4. ÉTAT DE SESSION (persistance des saisies)
 # ============================================================================
-# 4.a — Valeurs administratives par défaut (clés réutilisées par les widgets).
-ADMIN_DEFAULTS = {
+# 4.a — Exemples affichés en GRIS (placeholder) dans chaque champ texte.
+# Ce ne sont PAS des valeurs réelles : ils guident la saisie et disparaissent
+# dès que l'utilisateur tape — rien à effacer. Si un champ reste vide, son
+# exemple est repris tel quel dans les PDF générés (pour une démo cohérente).
+PLACEHOLDERS = {
     # Entité émettrice (entreprise)
     "company_name": "SMARTSITE RÉFECTION SAS",
     "company_address": "75 Avenue des Champs-Élysées, 75008 Paris",
@@ -311,7 +389,14 @@ ADMIN_DEFAULTS = {
     "claim_number": "ALZ-2026-9941X",
     "expert_name": "Cabinet Texa Évolution",
     "expert_ref": "EXP-55214-REV",
-    # Paramètres d'analyse
+}
+# Les champs texte démarrent VIDES → l'exemple gris (placeholder) s'affiche.
+for _k in PLACEHOLDERS:
+    st.session_state.setdefault(_k, "")
+
+# 4.a bis — Vraies valeurs par défaut des widgets non-texte (pas de placeholder
+# possible sur un selectbox / slider, donc on garde une valeur initiale).
+ADMIN_DEFAULTS = {
     "zone_select": list(ZONES.keys())[1],   # Zone B par défaut
     "expert_ht": 7500.0,
     "target_margin": 35.0,
@@ -754,14 +839,18 @@ def render_nav_buttons(active_index):
 def scroll_to_top_if_needed():
     """Fait défiler la page en haut juste après un changement d'étape."""
     if st.session_state.pop("_scroll_top", False):
-        st.iframe(
-            src="about:blank",
+        components.html(
+            """
+            <script>
+                const doc = window.parent.document;
+                const target = doc.querySelector('section.main')
+                            || doc.querySelector('[data-testid="stMain"]')
+                            || doc.scrollingElement || doc.documentElement;
+                if (target) { target.scrollTo({top: 0, behavior: 'smooth'}); }
+                window.parent.scrollTo({top: 0, behavior: 'smooth'});
+            </script>
+            """,
             height=0,
-            scrolling=False,
-        )
-        st.markdown(
-            "<script>window.parent.scrollTo({top:0,behavior:'smooth'});</script>",
-            unsafe_allow_html=True,
         )
 
 
@@ -809,15 +898,32 @@ def render_step1():
         if up is not None and not st.session_state.pdf_parsed:
             with st.spinner("Analyse du document et extraction des données clés…"):
                 info = extract_data_from_pdf(up)
-            for key in ("claim_number", "expert_name", "expert_ht"):
-                if key in info and info[key]:
+            # On remplit TOUS les champs reconnus (pas seulement 3).
+            fillable = ("claim_number", "expert_ref", "expert_name",
+                        "insurance_name", "client_name", "address", "expert_ht")
+            applied = []
+            labels = {
+                "claim_number": "N° sinistre", "expert_ref": "Réf. expert",
+                "expert_name": "Cabinet d'expertise", "insurance_name": "Compagnie",
+                "client_name": "Assuré", "address": "Adresse", "expert_ht": "Plafond HT",
+            }
+            for key in fillable:
+                if info.get(key):
                     st.session_state[key] = info[key]
+                    applied.append(labels[key])
             st.session_state.pdf_parsed = True
-            st.success("Données extraites et pré-remplies ✔")
+            st.session_state.pdf_applied = applied
             st.rerun()
         if st.session_state.pdf_parsed:
+            applied = st.session_state.get("pdf_applied", [])
+            if applied:
+                st.success("Champs pré-remplis depuis le PDF : " + ", ".join(applied) + " ✔")
+            else:
+                st.info("Aucune donnée exploitable détectée automatiquement. "
+                        "Complétez les champs manuellement ci-dessous.")
             if st.button("↻ Réinitialiser l'import PDF"):
                 st.session_state.pdf_parsed = False
+                st.session_state.pop("pdf_applied", None)
                 st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -825,12 +931,16 @@ def render_step1():
     st.markdown("##### 🏢 Entité émettrice (conformité légale du devis)")
     c1, c2 = st.columns(2)
     with c1:
-        st.text_input("Raison sociale", key="company_name")
-        st.text_input("Adresse du siège", key="company_address")
+        st.text_input("Raison sociale", key="company_name",
+                      placeholder=PLACEHOLDERS["company_name"])
+        st.text_input("Adresse du siège", key="company_address",
+                      placeholder=PLACEHOLDERS["company_address"])
     with c2:
         st.text_input("Numéro SIRET", key="company_siret", max_chars=20,
+                      placeholder=PLACEHOLDERS["company_siret"],
                       help="14 chiffres. Les espaces et tirets sont acceptés.")
-        st.text_input("N° TVA intracommunautaire", key="company_tva")
+        st.text_input("N° TVA intracommunautaire", key="company_tva",
+                      placeholder=PLACEHOLDERS["company_tva"])
 
     # Le SIRET accepte espaces et tirets (max_chars élargi). La validation est
     # purement INDICATIVE : elle n'empêche jamais la génération des documents.
@@ -848,14 +958,20 @@ def render_step1():
     st.markdown("##### 📁 Dossier client & sinistre")
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.text_input("Nom de l'assuré *", key="client_name")
-        st.text_input("Adresse du chantier *", key="address")
+        st.text_input("Nom de l'assuré *", key="client_name",
+                      placeholder=PLACEHOLDERS["client_name"])
+        st.text_input("Adresse du chantier *", key="address",
+                      placeholder=PLACEHOLDERS["address"])
     with c2:
-        st.text_input("Compagnie d'assurance *", key="insurance_name")
-        st.text_input("Numéro de sinistre *", key="claim_number")
+        st.text_input("Compagnie d'assurance *", key="insurance_name",
+                      placeholder=PLACEHOLDERS["insurance_name"])
+        st.text_input("Numéro de sinistre *", key="claim_number",
+                      placeholder=PLACEHOLDERS["claim_number"])
     with c3:
-        st.text_input("Cabinet d'expertise *", key="expert_name")
-        st.text_input("Référence rapport expert *", key="expert_ref")
+        st.text_input("Cabinet d'expertise *", key="expert_name",
+                      placeholder=PLACEHOLDERS["expert_name"])
+        st.text_input("Référence rapport expert *", key="expert_ref",
+                      placeholder=PLACEHOLDERS["expert_ref"])
 
     st.markdown("##### 🌍 Zone géographique")
     zc1, _ = st.columns([1, 2])
@@ -1008,7 +1124,10 @@ def render_step3():
                  "un nom d'assuré, un numéro de sinistre et un plafond expert > 0.")
 
     if st.button("🔥 Générer le dossier complet (3 PDF)", type="primary", disabled=blocking):
-        d = {k: st.session_state[k] for k in
+        # Un champ laissé vide reprend son exemple gris (placeholder) pour que
+        # l'en-tête des PDF ne comporte jamais de trou.
+        d = {k: (st.session_state[k].strip() or PLACEHOLDERS.get(k, ""))
+             for k in
              ("company_name", "company_address", "company_siret", "company_tva",
               "client_name", "address", "insurance_name", "claim_number",
               "expert_name", "expert_ref")}
