@@ -301,16 +301,21 @@ FIELD_SYNONYMS = {
                      "n sinistre", "reference du sinistre", "reference sinistre",
                      "ref sinistre", "sinistre", "n de dossier", "numero de dossier",
                      "reference dossier", "ref dossier", "dossier"],
-    "expert_ref": ["reference du rapport", "reference rapport", "ref rapport",
+    "expert_ref": ["numero d expert", "n d expert", "no d expert", "numero expert",
+                   "reference du rapport", "reference rapport", "ref rapport",
                    "n de rapport", "numero de rapport", "reference expert",
                    "ref expert", "reference de l expertise"],
     "expert_name": ["cabinet d expertise", "cabinet d expert", "cabinet",
-                    "expert missionne", "nom de l expert", "expert"],
-    "insurance_name": ["compagnie d assurance", "compagnie", "assureur", "assurance"],
-    "client_name": ["nom de l assure", "assure", "assuree", "client",
+                    "expert missionne", "nom de l expert", "expertise par",
+                    "expertise realisee par", "expert assure", "expert"],
+    "insurance_name": ["compagnie d assurance", "compagnie", "assureur",
+                       "nom de l assureur", "assurance"],
+    "client_name": ["nom et prenom", "nom prenom", "nom de l assure",
+                    "nom de l assure e", "assure", "assuree", "client",
                     "beneficiaire", "souscripteur"],
     "address": ["adresse du chantier", "adresse du bien", "adresse du sinistre",
-                "adresse des travaux", "lieu du sinistre", "adresse", "lieu"],
+                "adresse des travaux", "lieu du sinistre", "lieu des travaux",
+                "adresse", "lieu"],
     "expert_ht": ["montant total ht", "total general ht", "total ht", "montant ht",
                   "estimation ht", "evaluation ht", "plafond ht", "cout ht"],
 }
@@ -325,45 +330,70 @@ def _match_field(label_norm):
     return None
 
 
+def _clean_client(value):
+    """Retire une ou plusieurs civilites en tete (Monsieur/Madame, Mme, Mlle...).
+    Chaque civilite doit etre suivie d'un separateur (espace, / ou .) pour ne
+    jamais rogner une initiale de prenom (ex. « Marc » reste intact)."""
+    return re.sub(r"^(?:(?:monsieur|madame|mademoiselle|mlle|mme|mr)[\s./]+)+",
+                  "", value, flags=re.IGNORECASE).strip()
+
+
 def extract_data_from_pdf(pdf_file):
     """
     Pre-remplissage automatique fiable. On collecte des paires (libelle, valeur)
-    depuis DEUX sources complementaires :
-        1. les lignes de texte de la forme << Libelle : valeur >>
-        2. les tableaux du PDF (1re cellule = libelle, 2e = valeur)
-    puis on associe chaque libelle a un champ via une liste de synonymes
-    normalises (sans accents, sans ponctuation). Beaucoup plus robuste face a la
-    diversite des mises en page que des expressions regulieres globales.
-    Retourne uniquement les champs trouves avec confiance.
+    depuis le PDF en gerant DEUX dispositions courantes :
+        1. << Libelle : valeur >> sur la meme ligne
+        2. << Libelle : >> seul, la valeur etant sur la ou les ligne(s) suivante(s)
+           (cas frequent des rapports d'assurance en deux colonnes)
+    plus les tableaux du PDF. Chaque libelle est associe a un champ via une liste
+    de synonymes normalises (sans accents/ponctuation), bien plus robuste que des
+    expressions regulieres globales. Retourne les champs trouves avec confiance.
     """
     found = {}
     if not PDFPLUMBER_OK:
         return found
 
-    pairs = []   # liste de (libelle brut, valeur brute)
     full_text = ""
+    table_pairs = []
     try:
         with pdfplumber.open(pdf_file) as pdf:
             for page in pdf.pages:
-                txt = page.extract_text() or ""
-                full_text += txt + "\n"
-                # 1) lignes << cle : valeur >>
-                for line in txt.splitlines():
-                    if ":" in line:
-                        label, _, value = line.partition(":")
-                        pairs.append((label, value))
-                # 2) tableaux
+                full_text += (page.extract_text() or "") + "\n"
                 for table in (page.extract_tables() or []):
                     for row in table:
-                        cells = [c for c in row if c and str(c).strip()]
+                        cells = [str(c).strip() for c in row if c and str(c).strip()]
                         if len(cells) >= 2:
-                            pairs.append((cells[0], cells[1]))
+                            table_pairs.append((cells[0], cells[1]))
     except Exception as exc:
         st.warning(f"Lecture du PDF partielle : {exc}")
 
     full_text = full_text.replace("\xa0", " ")
+    lines = [ln.strip() for ln in full_text.splitlines()]
+    n = len(lines)
 
-    # --- Association libelle -> champ (on garde la 1re occurrence par champ) ---
+    def next_value(i):
+        """1re ligne suivante non vide qui n'est PAS elle-meme un libelle (: final)."""
+        j = i + 1
+        while j < n:
+            cand = lines[j].strip()
+            if cand and not cand.endswith(":"):
+                return cand
+            j += 1
+        return ""
+
+    # Construire les paires (libelle, valeur) en gerant la valeur sur ligne suivante.
+    pairs = []
+    for i, line in enumerate(lines):
+        if ":" not in line:
+            continue
+        label, _, value = line.partition(":")
+        value = value.strip()
+        if not value:                       # libelle seul -> valeur ligne suivante
+            value = next_value(i)
+        pairs.append((label, value))
+    pairs.extend(table_pairs)
+
+    # Association libelle -> champ (on garde la 1re occurrence par champ).
     for raw_label, raw_value in pairs:
         field = _match_field(_norm_label(raw_label))
         if not field or field in found:
@@ -379,10 +409,12 @@ def extract_data_from_pdf(pdf_file):
             m = re.search(r"[A-Za-z0-9][A-Za-z0-9\-/]{3,20}", value)
             if m:
                 found[field] = m.group(0)
+        elif field == "client_name":
+            found[field] = _clean_client(re.split(r"\s{2,}", value)[0])[:60]
         else:
             found[field] = re.split(r"\s{2,}", value)[0].strip()[:60]
 
-    # --- Filets de securite sur le texte brut si un champ cle manque ---
+    # --- Filets de securite sur le texte brut ---
     if "expert_ht" not in found:
         m = re.search(r"(?:total|montant|estimation|plafond)[^\n]{0,30}?HT[\s:]*"
                       r"([\d][\d\s.]*[.,]\d{2})", full_text, re.IGNORECASE)
@@ -392,10 +424,18 @@ def extract_data_from_pdf(pdf_file):
                 found["expert_ht"] = amount
 
     if "claim_number" not in found:
-        m = re.search(r"sinistre[\s:n0o]*([A-Z]{2,}[0-9][A-Z0-9\-/]{3,18})",
+        m = re.search(r"sinistre[\s:n°o]*([A-Z]{2,}[0-9][A-Z0-9\-/]{3,18})",
                       full_text, re.IGNORECASE)
         if m:
             found["claim_number"] = m.group(1)
+
+    # Compagnie d'assurance : souvent seulement dans l'en-tete (titre en capitales).
+    if "insurance_name" not in found:
+        m = re.search(r"([A-ZÉÈÀÂÎÔÛÇ][A-ZÉÈÀÂÎÔÛÇ'’\- ]{2,40}ASSURANCES?"
+                      r"[A-ZÉÈÀÂÎÔÛÇ'’\- ]{0,40}|ASSURANCES?[A-ZÉÈÀÂÎÔÛÇ'’\- ]{2,40})",
+                      full_text)
+        if m:
+            found["insurance_name"] = re.sub(r"\s+", " ", m.group(1)).strip()[:60]
 
     return found
 
