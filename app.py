@@ -23,7 +23,6 @@ import re
 import datetime
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 # Dépendances PDF (génération + extraction)
 from reportlab.lib.pagesizes import A4
@@ -743,11 +742,11 @@ def render_nav_buttons(active_index):
     st.divider()
     prev_c, mid_c, next_c = st.columns([1, 2, 1])
     if active_index > 0:
-        prev_c.button("← Étape précédente", use_container_width=True,
+        prev_c.button("← Étape précédente", width="stretch",
                       on_click=_goto_step, args=(STEPS[active_index - 1],),
                       key=f"prev_{active_index}")
     if active_index < len(STEPS) - 1:
-        next_c.button("Étape suivante →", type="primary", use_container_width=True,
+        next_c.button("Étape suivante →", type="primary", width="stretch",
                       on_click=_goto_step, args=(STEPS[active_index + 1],),
                       key=f"next_{active_index}")
 
@@ -755,18 +754,14 @@ def render_nav_buttons(active_index):
 def scroll_to_top_if_needed():
     """Fait défiler la page en haut juste après un changement d'étape."""
     if st.session_state.pop("_scroll_top", False):
-        components.html(
-            """
-            <script>
-                const doc = window.parent.document;
-                const target = doc.querySelector('section.main')
-                            || doc.querySelector('[data-testid="stMain"]')
-                            || doc.scrollingElement || doc.documentElement;
-                if (target) { target.scrollTo({top: 0, behavior: 'smooth'}); }
-                window.parent.scrollTo({top: 0, behavior: 'smooth'});
-            </script>
-            """,
+        st.iframe(
+            src="about:blank",
             height=0,
+            scrolling=False,
+        )
+        st.markdown(
+            "<script>window.parent.scrollTo({top:0,behavior:'smooth'});</script>",
+            unsafe_allow_html=True,
         )
 
 
@@ -992,7 +987,7 @@ def render_step3():
               "Qté": f"{r['qte']:g} {r['unite']}",
               "PU vente": format_currency(r["vente"]),
               "Total HT": format_currency(r["total_vente"])} for r in rows],
-            use_container_width=True, hide_index=True,
+            width="stretch", hide_index=True,
         )
     else:
         st.warning("Aucune ligne chiffrée. Revenez à l'**Étape 2** pour ajouter des travaux.")
@@ -1033,13 +1028,13 @@ def render_step3():
         d1, d2, d3 = st.columns(3)
         d1.download_button("📄 Fiche interne (confidentiel)", data=gen["fiche"],
                            file_name=f"fiche_interne_{gen['claim']}.pdf",
-                           mime="application/pdf", use_container_width=True)
+                           mime="application/pdf", width="stretch")
         d2.download_button("📑 Devis conforme (officiel)", data=gen["devis"],
                            file_name=f"devis_conforme_{gen['claim']}.pdf",
-                           mime="application/pdf", use_container_width=True)
+                           mime="application/pdf", width="stretch")
         d3.download_button("✉️ Lettre à l'expert", data=gen["lettre"],
                            file_name=f"lettre_expert_{gen['claim']}.pdf",
-                           mime="application/pdf", use_container_width=True)
+                           mime="application/pdf", width="stretch")
         st.caption("Vos saisies sont conservées : télécharger un document ne réinitialise rien.")
 
 
