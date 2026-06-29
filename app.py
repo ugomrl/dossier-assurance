@@ -1,20 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 ============================================================================
- GESTIONNAIRE STRATÉGIQUE DE SINISTRES — Plateforme SaaS de chiffrage BTP
+ GESTIONNAIRE STRATÉGIQUE DE SINISTRES — Plateforme de chiffrage BTP
 ============================================================================
-Workflow en 3 étapes :
-    Étape 1 : Import / Admin      -> Dépôt du rapport PDF + saisie entité & dossier
-    Étape 2 : Chiffrage par lots  -> Un expander par corps de métier, lignes dynamiques
-    Étape 3 : Génération & Dashboard -> KPI de marge, conformité expert, export PDF
-
-Principes d'implémentation :
-    - Tout est piloté par st.session_state : aucune donnée n'est perdue lors d'un
-      téléchargement (Streamlit relance le script à chaque clic).
-    - Le chiffrage est volontairement HORS st.form pour permettre :
-        * l'ajout / suppression de lignes via boutons "+"/"corbeille"
-        * la mise à jour des totaux EN TEMPS RÉEL
-    - Mobile-friendly : st.columns s'empile proprement sur petit écran.
+Réécriture complète (architecture senior) :
+    • Workflow 3 étapes piloté par st.session_state (aucune perte à chaque rerun)
+    • Extraction PDF robuste (libellés sur 2 colonnes + tableaux + synonymes)
+    • Persistance disque par identifiant d'URL (?sid) → survit refresh / retour
+    • Génération PDF blindée (try/except, jamais de crash silencieux)
+    • UI moderne et animée, cartes natives st.container(border=True)
 ============================================================================
 """
 
@@ -26,11 +20,11 @@ import uuid
 import tempfile
 import datetime
 import unicodedata
+import traceback
 
 import streamlit as st
 import streamlit.components.v1 as components
 
-# Dépendances PDF (génération + extraction)
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -38,14 +32,14 @@ from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_JUSTIFY
 from reportlab.lib import colors
 
 try:
-    import pdfplumber  # Extraction optionnelle du rapport d'expertise
+    import pdfplumber
     PDFPLUMBER_OK = True
-except Exception:  # L'app reste fonctionnelle même sans pdfplumber installé
+except Exception:
     PDFPLUMBER_OK = False
 
 
 # ============================================================================
-# 1. CONFIGURATION DE LA PAGE & CHARTE GRAPHIQUE (CSS)
+# 1. CONFIGURATION & CHARTE GRAPHIQUE
 # ============================================================================
 st.set_page_config(
     page_title="Gestionnaire Stratégique de Sinistres",
@@ -54,184 +48,180 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Palette high-tech
-NAVY = "#0F2A4A"        # Bleu marine profond — chrome sombre
-ANTHRACITE = "#1E293B"  # Gris anthracite — surfaces sombres
-ACCENT = "#3B82F6"      # Bleu électrique — accents / boutons
-ACCENT2 = "#22D3EE"     # Cyan — dégradés / glow
-SUCCESS = "#22C55E"     # Vert — statut conforme
-WARNING = "#F59E0B"     # Orange — vigilance
-DANGER = "#EF4444"      # Rouge — hors budget
-SURFACE = "#FFFFFF"     # Cartes (espace de travail clair)
-BG = "#EEF2F7"          # Fond général
+# Palette « premium »
+NAVY = "#0F2A4A"
+INK = "#0F1B2D"
+MUTED = "#5B6B7B"
+ACCENT = "#4F46E5"      # indigo
+ACCENT2 = "#06B6D4"     # cyan
+VIOLET = "#7C3AED"
+SUCCESS = "#10B981"
+WARNING = "#F59E0B"
+DANGER = "#EF4444"
+SURFACE = "#FFFFFF"
+BG = "#EEF2F9"
 
-INK = "#0F1B2D"   # Encre principale (texte sur fond clair) — contraste fort
-MUTED = "#5B6B7B"  # Texte secondaire / captions
+# Variables CSS (petit f-string) — le gros bloc CSS reste un string brut pour
+# éviter tout échappement d'accolades.
+_ROOT_VARS = f""":root {{
+    --navy:{NAVY}; --ink:{INK}; --muted:{MUTED};
+    --accent:{ACCENT}; --accent2:{ACCENT2}; --violet:{VIOLET};
+    --success:{SUCCESS}; --warning:{WARNING}; --danger:{DANGER};
+    --surface:{SURFACE}; --bg:{BG};
+}}"""
 
-# Injection CSS : design high-tech (chrome sombre + workspace clair), animations
-# et effets. On force EXPLICITEMENT les couleurs pour éliminer tout problème de
-# contraste (jamais de texte foncé sur fond foncé, ni clair sur clair).
-st.markdown(f"""
-<style>
-    /* ====================== BASE & FOND ====================== */
-    .stApp {{ background:
-        radial-gradient(1200px 600px at 110% -10%, rgba(59,130,246,.10), transparent 60%),
-        radial-gradient(900px 500px at -10% 10%, rgba(34,211,238,.08), transparent 55%),
-        {BG} !important; }}
-    [data-testid="stHeader"] {{ background: transparent; }}
-    .block-container {{ padding-top: 2rem; padding-bottom: 5rem; max-width: 1180px; }}
+_MAIN_CSS = """
+/* ====================== BASE ====================== */
+.stApp {
+    background:
+        radial-gradient(1100px 600px at 110% -8%, rgba(79,70,229,.12), transparent 60%),
+        radial-gradient(900px 520px at -10% 8%, rgba(6,182,212,.10), transparent 55%),
+        var(--bg) !important;
+}
+[data-testid="stHeader"] { background: transparent; }
+.block-container { padding-top: 1.6rem; padding-bottom: 5rem; max-width: 1180px; }
 
-    /* ====================== TEXTE (workspace clair) ====================== */
-    .stApp, .stApp p, .stApp li, .stApp label, .stApp span,
-    [data-testid="stMarkdownContainer"], [data-testid="stMarkdownContainer"] p,
-    [data-testid="stMarkdownContainer"] li,
-    [data-testid="stWidgetLabel"] p, [data-testid="stWidgetLabel"] label,
-    .stRadio label, .stSelectbox label, .stTextInput label,
-    .stNumberInput label, .stSlider label, .stFileUploader label {{
-        color: {INK} !important; }}
-    [data-testid="stCaptionContainer"], .stCaption, small {{ color: {MUTED} !important; }}
-    h1, h2, h3, h4, h5, h6 {{ color: {NAVY} !important; letter-spacing:.2px; }}
+/* ====================== TYPO ====================== */
+.stApp, .stApp p, .stApp li, .stApp label, .stApp span,
+[data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li,
+[data-testid="stWidgetLabel"] p, [data-testid="stWidgetLabel"] label {
+    color: var(--ink) !important;
+}
+[data-testid="stCaptionContainer"], small { color: var(--muted) !important; }
+h1, h2, h3, h4, h5, h6 { color: var(--navy) !important; letter-spacing:.2px; }
 
-    /* Champs de saisie clairs et nets */
-    .stTextInput input, .stNumberInput input,
-    .stSelectbox div[data-baseweb="select"] > div, textarea {{
-        background:#FFFFFF !important; color:{INK} !important;
-        border-radius:10px !important; border:1px solid #D7DEE8 !important; }}
-    .stTextInput input:focus, .stNumberInput input:focus {{
-        border-color:{ACCENT} !important; box-shadow:0 0 0 3px rgba(59,130,246,.18) !important; }}
-    input::placeholder, textarea::placeholder {{ color:#9AA7B4 !important; opacity:1; }}
+/* ====================== CHAMPS ====================== */
+.stTextInput input, .stNumberInput input,
+.stSelectbox div[data-baseweb="select"] > div, textarea {
+    background:#FFFFFF !important; color:var(--ink) !important;
+    border-radius:11px !important; border:1px solid #D7DEE8 !important;
+    transition:border-color .15s ease, box-shadow .15s ease;
+}
+.stTextInput input:focus, .stNumberInput input:focus {
+    border-color:var(--accent) !important; box-shadow:0 0 0 3px rgba(79,70,229,.16) !important;
+}
+input::placeholder, textarea::placeholder { color:#9AA7B4 !important; opacity:1; font-style:italic; }
+[data-baseweb="popover"], [data-baseweb="menu"], ul[role="listbox"] { background:#FFFFFF !important; }
+li[role="option"], [data-baseweb="menu"] * { color:var(--ink) !important; }
+li[role="option"]:hover { background:#EEF0FF !important; }
+[data-testid="stDataFrame"] * { color:var(--ink) !important; }
 
-    /* Menus déroulants : fond blanc + texte foncé (corrige le foncé-sur-foncé) */
-    [data-baseweb="popover"], [data-baseweb="menu"], ul[role="listbox"] {{
-        background:#FFFFFF !important; }}
-    li[role="option"], [data-baseweb="menu"] * {{ color:{INK} !important; }}
-    li[role="option"]:hover {{ background:#EEF4FF !important; }}
+/* ====================== ANIMATIONS ====================== */
+@keyframes shift { 0%{background-position:0% 50%} 50%{background-position:100% 50%} 100%{background-position:0% 50%} }
+@keyframes fadeInUp { from{opacity:0; transform:translateY(12px)} to{opacity:1; transform:none} }
+@keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(6,182,212,.55)} 70%{box-shadow:0 0 0 10px rgba(6,182,212,0)} 100%{box-shadow:0 0 0 0 rgba(6,182,212,0)} }
+@keyframes floaty { 0%{transform:translateY(0)} 50%{transform:translateY(-14px)} 100%{transform:translateY(0)} }
+@keyframes shimmer { 0%{background-position:-200% 0} 100%{background-position:200% 0} }
 
-    /* Dataframe lisible */
-    [data-testid="stDataFrame"] {{ background:#FFFFFF; border:1px solid #E2E8F0; border-radius:12px; }}
-    [data-testid="stDataFrame"] * {{ color:{INK} !important; }}
+/* ====================== HERO ====================== */
+.hero { position:relative; overflow:hidden; border-radius:22px; padding:30px 34px;
+    margin-bottom:16px; color:#fff;
+    background:linear-gradient(120deg, #0B1F38, #15356b, #4F46E5, #15356b, #0B1F38);
+    background-size:300% 300%; animation:shift 16s ease infinite;
+    box-shadow:0 22px 60px rgba(15,42,74,.38); border:1px solid rgba(255,255,255,.10); }
+.hero::after { content:""; position:absolute; inset:0; pointer-events:none;
+    background-image:linear-gradient(rgba(255,255,255,.06) 1px, transparent 1px),
+                     linear-gradient(90deg, rgba(255,255,255,.06) 1px, transparent 1px);
+    background-size:30px 30px; mask:radial-gradient(60% 120% at 82% 0%, #000, transparent 70%); }
+.hero .orb { position:absolute; border-radius:50%; filter:blur(8px); opacity:.55; animation:floaty 7s ease-in-out infinite; }
+.hero .orb.a { width:120px; height:120px; right:60px; top:-30px; background:rgba(6,182,212,.45); }
+.hero .orb.b { width:80px; height:80px; right:180px; bottom:-20px; background:rgba(124,58,237,.45); animation-delay:1.5s; }
+.hero h1 { color:#fff !important; margin:0; font-size:1.65rem; position:relative; z-index:1; }
+.hero p { color:#C7D6EC !important; margin:.45rem 0 0 0; font-size:.95rem; position:relative; z-index:1; }
+.hero .live { position:relative; z-index:1; display:inline-flex; align-items:center; gap:8px;
+    margin-bottom:10px; padding:5px 13px; border-radius:999px; font-size:.72rem; font-weight:700;
+    letter-spacing:.6px; color:#E0F2FE !important; background:rgba(255,255,255,.10);
+    border:1px solid rgba(255,255,255,.20); }
+.hero .dot { width:8px; height:8px; border-radius:50%; background:var(--accent2); animation:pulse 1.8s infinite; }
 
-    /* ====================== ANIMATIONS ====================== */
-    @keyframes shift {{ 0%{{background-position:0% 50%}} 50%{{background-position:100% 50%}}
-                        100%{{background-position:0% 50%}} }}
-    @keyframes fadeInUp {{ from{{opacity:0; transform:translateY(10px)}} to{{opacity:1; transform:none}} }}
-    @keyframes pulse {{ 0%{{box-shadow:0 0 0 0 rgba(34,211,238,.55)}}
-                        70%{{box-shadow:0 0 0 9px rgba(34,211,238,0)}}
-                        100%{{box-shadow:0 0 0 0 rgba(34,211,238,0)}} }}
+/* ====================== STEPPER ====================== */
+.tech-progress { height:7px; border-radius:999px; background:#DCE3EC; overflow:hidden; margin:4px 2px 16px; }
+.tech-progress > span { display:block; height:100%; border-radius:999px;
+    background:linear-gradient(90deg, var(--accent2), var(--accent), var(--violet));
+    background-size:200% 100%; animation:shimmer 2.4s linear infinite;
+    transition:width .6s cubic-bezier(.4,0,.2,1); }
+.crumbs { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px; }
+.crumb { flex:1; min-width:150px; background:rgba(255,255,255,.78); backdrop-filter:blur(8px);
+    border:1px solid #E2E8F0; border-radius:14px; padding:11px 14px;
+    box-shadow:0 2px 10px rgba(0,0,0,.04); transition:transform .2s ease, box-shadow .2s ease; }
+.crumb:hover { transform:translateY(-2px); box-shadow:0 10px 24px rgba(15,27,45,.10); }
+.crumb .n { display:inline-flex; align-items:center; justify-content:center; width:25px; height:25px;
+    border-radius:50%; background:#E2E8F0; color:var(--muted) !important; font-weight:800;
+    font-size:.8rem; margin-right:9px; transition:all .25s ease; }
+.crumb .t { color:var(--muted) !important; font-weight:700; font-size:.86rem; }
+.crumb.active { border-color:transparent; background:linear-gradient(120deg, var(--navy), var(--accent)); }
+.crumb.active .n { background:#fff; color:var(--accent) !important; }
+.crumb.active .t { color:#fff !important; }
+.crumb.done .n { background:var(--success); color:#fff !important; }
 
-    /* ====================== BANDEAU (HERO) ====================== */
-    .hero {{ position:relative; overflow:hidden; border-radius:18px; padding:30px 32px;
-        margin-bottom:18px; color:#fff;
-        background: linear-gradient(120deg, {NAVY}, #15356b, {ACCENT}, #15356b, {NAVY});
-        background-size:300% 300%; animation:shift 14s ease infinite;
-        box-shadow:0 18px 50px rgba(15,42,74,.35);
-        border:1px solid rgba(255,255,255,.10); }}
-    .hero::after {{ content:""; position:absolute; inset:0; pointer-events:none;
-        background-image:linear-gradient(rgba(255,255,255,.06) 1px, transparent 1px),
-                         linear-gradient(90deg, rgba(255,255,255,.06) 1px, transparent 1px);
-        background-size:26px 26px; mask:radial-gradient(60% 120% at 80% 0%, #000, transparent 70%); }}
-    .hero h1 {{ color:#fff !important; margin:0; font-size:1.6rem; letter-spacing:.3px;
-        position:relative; z-index:1; }}
-    .hero p {{ color:#C7D6EC !important; margin:.4rem 0 0 0; font-size:.95rem;
-        position:relative; z-index:1; }}
-    .hero .live {{ position:relative; z-index:1; display:inline-flex; align-items:center; gap:8px;
-        margin-bottom:10px; padding:5px 12px; border-radius:999px; font-size:.72rem; font-weight:700;
-        letter-spacing:.6px; color:#E0F2FE !important; background:rgba(255,255,255,.10);
-        border:1px solid rgba(255,255,255,.18); }}
-    .hero .dot {{ width:8px; height:8px; border-radius:50%; background:{ACCENT2};
-        animation:pulse 1.8s infinite; }}
+/* ====================== KPI ====================== */
+.kpi { position:relative; background:var(--surface); border:1px solid #E6EBF2; border-radius:16px;
+    padding:18px; height:100%; overflow:hidden; box-shadow:0 6px 22px rgba(15,27,45,.06);
+    animation:fadeInUp .45s ease both; transition:transform .2s ease, box-shadow .2s ease; }
+.kpi::before { content:""; position:absolute; top:0; left:0; right:0; height:4px;
+    background:var(--kpi-accent, linear-gradient(90deg, var(--accent2), var(--accent))); }
+.kpi:hover { transform:translateY(-4px); box-shadow:0 18px 36px rgba(15,27,45,.13); }
+.kpi .label { color:var(--muted) !important; font-size:.72rem; text-transform:uppercase; letter-spacing:.7px; font-weight:800; }
+.kpi .value { color:var(--navy) !important; font-size:1.55rem; font-weight:800; margin-top:6px; font-feature-settings:"tnum"; }
+.kpi .sub { color:#94A3B8 !important; font-size:.8rem; margin-top:3px; }
 
-    /* ====================== BARRE DE PROGRESSION ====================== */
-    .tech-progress {{ height:6px; border-radius:999px; background:#DCE3EC; overflow:hidden; margin:0 2px 18px 2px; }}
-    .tech-progress > span {{ display:block; height:100%; border-radius:999px;
-        background:linear-gradient(90deg, {ACCENT2}, {ACCENT}); transition:width .5s cubic-bezier(.4,0,.2,1);
-        box-shadow:0 0 12px rgba(59,130,246,.6); }}
+/* ====================== STATUT ====================== */
+.status-box { border-radius:14px; padding:16px 20px; margin:6px 0 14px; animation:fadeInUp .4s ease both; }
+.status-box h4 { margin:0 0 4px; font-size:1.05rem; }
+.status-box p { margin:0; color:#334155 !important; }
 
-    /* ====================== FIL D'ARIANE ====================== */
-    .crumbs {{ display:flex; gap:10px; flex-wrap:wrap; margin-bottom:8px; }}
-    .crumb {{ flex:1; min-width:150px; background:rgba(255,255,255,.75); backdrop-filter:blur(8px);
-        border:1px solid #E2E8F0; border-radius:12px; padding:11px 14px;
-        box-shadow:0 2px 10px rgba(0,0,0,.04); transition:all .25s ease; }}
-    .crumb .n {{ display:inline-block; width:24px; height:24px; border-radius:50%; background:#E2E8F0;
-        color:{MUTED} !important; text-align:center; line-height:24px; font-weight:700;
-        font-size:.8rem; margin-right:9px; transition:all .25s ease; }}
-    .crumb .t {{ color:{MUTED} !important; font-weight:600; font-size:.86rem; }}
-    .crumb.active {{ border-color:transparent;
-        background:linear-gradient(120deg, {NAVY}, {ACCENT}); box-shadow:0 8px 22px rgba(59,130,246,.35); }}
-    .crumb.active .n {{ background:#fff; color:{ACCENT} !important; }}
-    .crumb.active .t {{ color:#fff !important; }}
-    .crumb.done .n {{ background:{SUCCESS}; color:#fff !important; }}
+/* ====================== CHECKLIST ====================== */
+.check { display:flex; align-items:center; gap:10px; padding:7px 12px; border-radius:10px;
+    margin-bottom:6px; font-size:.9rem; font-weight:600; }
+.check.ok { background:rgba(16,185,129,.10); color:#0F766E !important; }
+.check.ko { background:rgba(239,68,68,.10); color:#B91C1C !important; }
+.check .ic { font-size:1rem; }
 
-    /* ====================== CARTES ====================== */
-    .card {{ background:{SURFACE}; border:1px solid #E6EBF2; border-radius:16px; padding:18px 20px;
-        box-shadow:0 6px 22px rgba(15,27,45,.05); margin-bottom:16px; animation:fadeInUp .45s ease both; }}
+.col-head { color:var(--muted) !important; font-size:.72rem; text-transform:uppercase; letter-spacing:.5px; font-weight:800; }
 
-    /* ====================== KPI ====================== */
-    .kpi {{ position:relative; background:{SURFACE}; border:1px solid #E6EBF2; border-radius:16px;
-        padding:18px 18px 16px; height:100%; overflow:hidden;
-        box-shadow:0 6px 22px rgba(15,27,45,.06); animation:fadeInUp .45s ease both;
-        transition:transform .2s ease, box-shadow .2s ease; }}
-    .kpi::before {{ content:""; position:absolute; top:0; left:0; right:0; height:4px;
-        background:var(--kpi-accent, linear-gradient(90deg, {ACCENT2}, {ACCENT})); }}
-    .kpi:hover {{ transform:translateY(-3px); box-shadow:0 16px 34px rgba(15,27,45,.12); }}
-    .kpi .label {{ color:{MUTED} !important; font-size:.74rem; text-transform:uppercase;
-        letter-spacing:.7px; font-weight:700; }}
-    .kpi .value {{ color:{NAVY} !important; font-size:1.55rem; font-weight:800; margin-top:6px;
-        font-feature-settings:"tnum"; }}
-    .kpi .sub {{ color:#94A3B8 !important; font-size:.8rem; margin-top:3px; }}
+/* ====================== BOUTONS ====================== */
+.stButton > button, .stDownloadButton > button { border-radius:12px; font-weight:700;
+    border:1px solid #CBD5E0; color:var(--ink); background:#FFFFFF; transition:all .18s ease; }
+.stButton > button:hover, .stDownloadButton > button:hover { transform:translateY(-2px);
+    box-shadow:0 10px 22px rgba(79,70,229,.18); border-color:var(--accent); color:var(--navy); }
+.stButton > button[kind="primary"], .stDownloadButton > button {
+    background:linear-gradient(120deg, var(--accent), var(--navy)) !important; color:#fff !important;
+    border:none !important; box-shadow:0 8px 20px rgba(79,70,229,.30) !important; }
+.stButton > button[kind="primary"]:hover, .stDownloadButton > button:hover {
+    box-shadow:0 12px 30px rgba(79,70,229,.45) !important; color:#fff !important; }
+.stButton > button[kind="primary"]:disabled { opacity:.45; box-shadow:none !important; }
 
-    /* ====================== STATUT ====================== */
-    .status-box {{ border-radius:14px; padding:16px 20px; margin:6px 0 18px 0; font-weight:500;
-        animation:fadeInUp .4s ease both; }}
-    .status-box h4 {{ margin:0 0 4px 0; font-size:1.05rem; }}
-    .status-box p {{ margin:0; color:#334155 !important; }}
+/* ====================== CARTES / CONTENEURS ====================== */
+div[data-testid="stVerticalBlockBorderWrapper"] {
+    background:#FFFFFF; border-radius:16px !important; box-shadow:0 6px 22px rgba(15,27,45,.05);
+    animation:fadeInUp .4s ease both; }
+div[data-testid="stExpander"] { border-radius:14px; border:1px solid #E6EBF2; background:#FFFFFF;
+    box-shadow:0 4px 16px rgba(15,27,45,.04); transition:box-shadow .2s ease; }
+div[data-testid="stExpander"]:hover { box-shadow:0 10px 26px rgba(15,27,45,.08); }
+div[data-testid="stExpander"] summary p { color:var(--navy) !important; font-weight:700; }
+div[data-testid="stAlert"] p { color:var(--ink) !important; }
+hr { border-color:#E2E8F0 !important; }
 
-    .col-head {{ color:{MUTED} !important; font-size:.72rem; text-transform:uppercase;
-        letter-spacing:.5px; font-weight:700; padding-bottom:2px; }}
+/* ====================== SIDEBAR ====================== */
+section[data-testid="stSidebar"] > div {
+    background:linear-gradient(180deg, #0B1F38 0%, var(--navy) 100%) !important;
+    border-right:1px solid rgba(255,255,255,.06); }
+section[data-testid="stSidebar"] p, section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] span, section[data-testid="stSidebar"] div,
+section[data-testid="stSidebar"] h1, section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3 { color:#E2E8F0 !important; }
+section[data-testid="stSidebar"] h3 { color:#FFFFFF !important; }
+section[data-testid="stSidebar"] [data-testid="stMetricValue"] { color:#FFFFFF !important; }
+section[data-testid="stSidebar"] [data-testid="stMetricLabel"] * { color:#9FB3CC !important; }
+section[data-testid="stSidebar"] [data-testid="stMetricDelta"] * { color:var(--accent2) !important; }
+"""
 
-    /* ====================== BOUTONS ====================== */
-    .stButton > button, .stDownloadButton > button {{ border-radius:12px; font-weight:700;
-        border:1px solid #CBD5E0; color:{INK}; background:#FFFFFF; transition:all .18s ease; }}
-    .stButton > button:hover, .stDownloadButton > button:hover {{ transform:translateY(-2px);
-        box-shadow:0 10px 22px rgba(59,130,246,.18); border-color:{ACCENT}; color:{NAVY}; }}
-    .stButton > button[kind="primary"], .stDownloadButton > button {{
-        background:linear-gradient(120deg, {ACCENT}, {NAVY}) !important; color:#fff !important;
-        border:none !important; box-shadow:0 8px 20px rgba(59,130,246,.30) !important; }}
-    .stButton > button[kind="primary"]:hover, .stDownloadButton > button:hover {{
-        box-shadow:0 12px 28px rgba(59,130,246,.45) !important; color:#fff !important; }}
-    .stButton > button[kind="primary"]:disabled {{ opacity:.45; box-shadow:none !important; }}
-
-    /* ====================== EXPANDERS ====================== */
-    div[data-testid="stExpander"] {{ border-radius:14px; border:1px solid #E6EBF2; background:#FFFFFF;
-        box-shadow:0 4px 16px rgba(15,27,45,.04); transition:box-shadow .2s ease; }}
-    div[data-testid="stExpander"]:hover {{ box-shadow:0 10px 26px rgba(15,27,45,.08); }}
-    div[data-testid="stExpander"] summary p {{ color:{NAVY} !important; font-weight:700; }}
-
-    div[data-testid="stAlert"] p {{ color:{INK} !important; }}
-    hr {{ border-color:#E2E8F0 !important; }}
-
-    /* ====================== SIDEBAR SOMBRE ====================== */
-    section[data-testid="stSidebar"] > div {{
-        background:linear-gradient(180deg, #0B1F38 0%, {NAVY} 100%) !important;
-        border-right:1px solid rgba(255,255,255,.06); }}
-    section[data-testid="stSidebar"] p, section[data-testid="stSidebar"] label,
-    section[data-testid="stSidebar"] span, section[data-testid="stSidebar"] div,
-    section[data-testid="stSidebar"] h1, section[data-testid="stSidebar"] h2,
-    section[data-testid="stSidebar"] h3 {{ color:#E2E8F0 !important; }}
-    section[data-testid="stSidebar"] h3 {{ color:#FFFFFF !important; }}
-    section[data-testid="stSidebar"] [data-testid="stMetricValue"] {{ color:#FFFFFF !important; }}
-    section[data-testid="stSidebar"] [data-testid="stMetricLabel"] * {{ color:#9FB3CC !important; }}
-    section[data-testid="stSidebar"] [data-testid="stMetricDelta"] * {{ color:{ACCENT2} !important; }}
-    section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] {{ color:#8FA3BD !important; }}
-</style>
-""", unsafe_allow_html=True)
+st.markdown(f"<style>{_ROOT_VARS}{_MAIN_CSS}</style>", unsafe_allow_html=True)
 
 
 # ============================================================================
 # 2. CONSTANTES MÉTIER
 # ============================================================================
-# Liste exhaustive des corps d'état. Chacun est facultatif : il n'apparaît dans
-# les calculs et les PDF que si l'utilisateur y ajoute au moins une ligne.
 CORPS_METIER = [
     ("🏠 Toiture / Couverture", "Toiture"),
     ("🚿 Plomberie", "Plomberie"),
@@ -242,41 +232,43 @@ CORPS_METIER = [
     ("🟫 Revêtement de sol", "Sol"),
     ("👷 Main d'œuvre", "MainOeuvre"),
 ]
-
-# Unités proposées par défaut pour chaque ligne
 UNITES = ["m²", "ml", "u", "h", "forfait", "kg", "L"]
+ZONES = {"Zone A  (×1,00)": 1.00, "Zone B  (×1,15)": 1.15, "Zone C  (×1,25)": 1.25}
+TVA_RATE = 0.10
 
-# Coefficients de majoration géographique
-ZONES = {
-    "Zone A  (×1,00)": 1.00,
-    "Zone B  (×1,15)": 1.15,
-    "Zone C  (×1,25)": 1.25,
+PLACEHOLDERS = {
+    "company_name": "SMARTSITE RÉFECTION SAS",
+    "company_address": "75 Avenue des Champs-Élysées, 75008 Paris",
+    "company_siret": "12345678901234",
+    "company_tva": "FR12123456789",
+    "client_name": "Société Immobilière Horizon",
+    "address": "14 Avenue de la République, 75011 Paris",
+    "insurance_name": "Allianz France",
+    "claim_number": "ALZ-2026-9941X",
+    "expert_name": "Cabinet Texa Évolution",
+    "expert_ref": "EXP-55214-REV",
 }
 
-TVA_RATE = 0.10  # TVA travaux de rénovation après sinistre
-
 
 # ============================================================================
-# 3. FONCTIONS UTILITAIRES
+# 3. UTILITAIRES
 # ============================================================================
 def format_currency(value):
-    """Formatage monétaire aux standards français : 1 234,56 €."""
-    if value is None:
+    """Format français : 1 234,56 €. Tolère None / chaînes."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
         value = 0.0
     return f"{value:,.2f}".replace(",", " ").replace(".", ",") + " €"
 
 
 def validate_siret(siret):
-    """Un SIRET valide comporte exactement 14 chiffres."""
     return len(re.sub(r"\D", "", str(siret))) == 14
 
 
 def _parse_amount(raw):
-    """Convertit '7 500,00' ou '7.500,00' ou '7500.00' en float. None si invalide."""
-    s = re.sub(r"[^\d,.\s]", "", raw).strip()
-    s = s.replace(" ", "")
-    # Si la virgule est le séparateur décimal (format FR) : retirer les points
-    # de milliers puis transformer la virgule en point.
+    """'7 500,00' / '7.500,00' / '7500.00' → float ; None si invalide."""
+    s = re.sub(r"[^\d,.\s]", "", str(raw)).strip().replace(" ", "")
     if "," in s:
         s = s.replace(".", "").replace(",", ".")
     try:
@@ -285,44 +277,36 @@ def _parse_amount(raw):
         return None
 
 
+# ============================================================================
+# 4. MOTEUR D'EXTRACTION PDF
+# ============================================================================
 def _norm_label(s):
-    """Normalise un libelle : sans accents, minuscules, ponctuation -> espaces."""
     s = unicodedata.normalize("NFD", s or "")
     s = "".join(c for c in s if unicodedata.category(c) != "Mn")
     s = re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
     return re.sub(r"\s+", " ", s)
 
 
-# Synonymes de libelles rencontres dans les rapports reels. L'ordre des champs
-# compte (on attribue au premier qui correspond) ; au sein d'un champ, placer
-# les variantes les plus specifiques en premier.
 FIELD_SYNONYMS = {
-    "claim_number": ["n de sinistre", "no de sinistre", "numero de sinistre",
-                     "n sinistre", "reference du sinistre", "reference sinistre",
-                     "ref sinistre", "sinistre", "n de dossier", "numero de dossier",
-                     "reference dossier", "ref dossier", "dossier"],
+    "claim_number": ["n de sinistre", "no de sinistre", "numero de sinistre", "n sinistre",
+                     "reference du sinistre", "reference sinistre", "ref sinistre", "sinistre",
+                     "n de dossier", "numero de dossier", "reference dossier", "ref dossier", "dossier"],
     "expert_ref": ["numero d expert", "n d expert", "no d expert", "numero expert",
-                   "reference du rapport", "reference rapport", "ref rapport",
-                   "n de rapport", "numero de rapport", "reference expert",
-                   "ref expert", "reference de l expertise"],
-    "expert_name": ["cabinet d expertise", "cabinet d expert", "cabinet",
-                    "expert missionne", "nom de l expert", "expertise par",
-                    "expertise realisee par", "expert assure", "expert"],
-    "insurance_name": ["compagnie d assurance", "compagnie", "assureur",
-                       "nom de l assureur", "assurance"],
-    "client_name": ["nom et prenom", "nom prenom", "nom de l assure",
-                    "nom de l assure e", "assure", "assuree", "client",
-                    "beneficiaire", "souscripteur"],
-    "address": ["adresse du chantier", "adresse du bien", "adresse du sinistre",
-                "adresse des travaux", "lieu du sinistre", "lieu des travaux",
-                "adresse", "lieu"],
+                   "reference du rapport", "reference rapport", "ref rapport", "n de rapport",
+                   "numero de rapport", "reference expert", "ref expert", "reference de l expertise"],
+    "expert_name": ["cabinet d expertise", "cabinet d expert", "cabinet", "expert missionne",
+                    "nom de l expert", "expertise par", "expertise realisee par", "expert assure", "expert"],
+    "insurance_name": ["compagnie d assurance", "compagnie", "assureur", "nom de l assureur", "assurance"],
+    "client_name": ["nom et prenom", "nom prenom", "nom de l assure", "assure", "assuree",
+                    "client", "beneficiaire", "souscripteur"],
+    "address": ["adresse du chantier", "adresse du bien", "adresse du sinistre", "adresse des travaux",
+                "lieu du sinistre", "lieu des travaux", "adresse", "lieu"],
     "expert_ht": ["montant total ht", "total general ht", "total ht", "montant ht",
-                  "estimation ht", "evaluation ht", "plafond ht", "cout ht"],
+                  "estimation ht", "evaluation ht", "plafond ht", "cout ht", "montant des travaux ht"],
 }
 
 
 def _match_field(label_norm):
-    """Renvoie le champ correspondant a un libelle normalise, sinon None."""
     for field, syns in FIELD_SYNONYMS.items():
         for syn in syns:
             if label_norm == syn or label_norm.startswith(syn + " "):
@@ -331,23 +315,17 @@ def _match_field(label_norm):
 
 
 def _clean_client(value):
-    """Retire une ou plusieurs civilites en tete (Monsieur/Madame, Mme, Mlle...).
-    Chaque civilite doit etre suivie d'un separateur (espace, / ou .) pour ne
-    jamais rogner une initiale de prenom (ex. « Marc » reste intact)."""
+    """Retire les civilités de tête (Monsieur/Madame…) sans rogner un prénom."""
     return re.sub(r"^(?:(?:monsieur|madame|mademoiselle|mlle|mme|mr)[\s./]+)+",
                   "", value, flags=re.IGNORECASE).strip()
 
 
 def extract_data_from_pdf(pdf_file):
     """
-    Pre-remplissage automatique fiable. On collecte des paires (libelle, valeur)
-    depuis le PDF en gerant DEUX dispositions courantes :
-        1. << Libelle : valeur >> sur la meme ligne
-        2. << Libelle : >> seul, la valeur etant sur la ou les ligne(s) suivante(s)
-           (cas frequent des rapports d'assurance en deux colonnes)
-    plus les tableaux du PDF. Chaque libelle est associe a un champ via une liste
-    de synonymes normalises (sans accents/ponctuation), bien plus robuste que des
-    expressions regulieres globales. Retourne les champs trouves avec confiance.
+    Extraction fiable : paires (libellé, valeur) issues de
+      1) lignes « Libellé : valeur » (valeur éventuellement sur la ligne suivante)
+      2) tableaux du PDF
+    puis association via synonymes normalisés. Retourne les champs sûrs.
     """
     found = {}
     if not PDFPLUMBER_OK:
@@ -372,7 +350,6 @@ def extract_data_from_pdf(pdf_file):
     n = len(lines)
 
     def next_value(i):
-        """1re ligne suivante non vide qui n'est PAS elle-meme un libelle (: final)."""
         j = i + 1
         while j < n:
             cand = lines[j].strip()
@@ -381,19 +358,17 @@ def extract_data_from_pdf(pdf_file):
             j += 1
         return ""
 
-    # Construire les paires (libelle, valeur) en gerant la valeur sur ligne suivante.
     pairs = []
     for i, line in enumerate(lines):
         if ":" not in line:
             continue
         label, _, value = line.partition(":")
         value = value.strip()
-        if not value:                       # libelle seul -> valeur ligne suivante
+        if not value:
             value = next_value(i)
         pairs.append((label, value))
     pairs.extend(table_pairs)
 
-    # Association libelle -> champ (on garde la 1re occurrence par champ).
     for raw_label, raw_value in pairs:
         field = _match_field(_norm_label(raw_label))
         if not field or field in found:
@@ -414,7 +389,6 @@ def extract_data_from_pdf(pdf_file):
         else:
             found[field] = re.split(r"\s{2,}", value)[0].strip()[:60]
 
-    # --- Filets de securite sur le texte brut ---
     if "expert_ht" not in found:
         m = re.search(r"(?:total|montant|estimation|plafond)[^\n]{0,30}?HT[\s:]*"
                       r"([\d][\d\s.]*[.,]\d{2})", full_text, re.IGNORECASE)
@@ -424,16 +398,13 @@ def extract_data_from_pdf(pdf_file):
                 found["expert_ht"] = amount
 
     if "claim_number" not in found:
-        m = re.search(r"sinistre[\s:n°o]*([A-Z]{2,}[0-9][A-Z0-9\-/]{3,18})",
-                      full_text, re.IGNORECASE)
+        m = re.search(r"sinistre[\s:n°o]*([A-Z]{2,}[0-9][A-Z0-9\-/]{3,18})", full_text, re.IGNORECASE)
         if m:
             found["claim_number"] = m.group(1)
 
-    # Compagnie d'assurance : souvent seulement dans l'en-tete (titre en capitales).
     if "insurance_name" not in found:
-        m = re.search(r"([A-ZÉÈÀÂÎÔÛÇ][A-ZÉÈÀÂÎÔÛÇ'’\- ]{2,40}ASSURANCES?"
-                      r"[A-ZÉÈÀÂÎÔÛÇ'’\- ]{0,40}|ASSURANCES?[A-ZÉÈÀÂÎÔÛÇ'’\- ]{2,40})",
-                      full_text)
+        m = re.search(r"([A-ZÉÈÀÂÎÔÛÇ][A-ZÉÈÀÂÎÔÛÇ'’\- ]{2,40}ASSURANCES?[A-ZÉÈÀÂÎÔÛÇ'’\- ]{0,40}"
+                      r"|ASSURANCES?[A-ZÉÈÀÂÎÔÛÇ'’\- ]{2,40})", full_text)
         if m:
             found["insurance_name"] = re.sub(r"\s+", " ", m.group(1)).strip()[:60]
 
@@ -441,56 +412,25 @@ def extract_data_from_pdf(pdf_file):
 
 
 # ============================================================================
-# 4. ÉTAT DE SESSION (persistance des saisies)
+# 5. ÉTAT DE SESSION
 # ============================================================================
-# 4.a — Exemples affichés en GRIS (placeholder) dans chaque champ texte.
-# Ce ne sont PAS des valeurs réelles : ils guident la saisie et disparaissent
-# dès que l'utilisateur tape — rien à effacer. Si un champ reste vide, son
-# exemple est repris tel quel dans les PDF générés (pour une démo cohérente).
-PLACEHOLDERS = {
-    # Entité émettrice (entreprise)
-    "company_name": "SMARTSITE RÉFECTION SAS",
-    "company_address": "75 Avenue des Champs-Élysées, 75008 Paris",
-    "company_siret": "12345678901234",
-    "company_tva": "FR12123456789",
-    # Dossier / sinistre
-    "client_name": "Société Immobilière Horizon",
-    "address": "14 Avenue de la République, 75011 Paris",
-    "insurance_name": "Allianz France",
-    "claim_number": "ALZ-2026-9941X",
-    "expert_name": "Cabinet Texa Évolution",
-    "expert_ref": "EXP-55214-REV",
-}
-# Les champs texte démarrent VIDES → l'exemple gris (placeholder) s'affiche.
 for _k in PLACEHOLDERS:
     st.session_state.setdefault(_k, "")
-
-# 4.a bis — Vraies valeurs par défaut des widgets non-texte (pas de placeholder
-# possible sur un selectbox / slider, donc on garde une valeur initiale).
-ADMIN_DEFAULTS = {
-    "zone_select": list(ZONES.keys())[1],   # Zone B par défaut
-    "expert_ht": 7500.0,
-    "target_margin": 35.0,
-}
-for _k, _v in ADMIN_DEFAULTS.items():
+for _k, _v in {"zone_select": list(ZONES.keys())[1], "expert_ht": 7500.0,
+               "target_margin": 35.0}.items():
     st.session_state.setdefault(_k, _v)
 
-# 4.b — Structure des lignes de chiffrage : { code_corps: [id_ligne, ...] }
 if "lots" not in st.session_state:
     st.session_state.lots = {code: [] for _, code in CORPS_METIER}
-if "line_counter" not in st.session_state:
-    st.session_state.line_counter = 0
-
-# 4.c — Navigation & documents générés
+st.session_state.setdefault("line_counter", 0)
 st.session_state.setdefault("nav_step", "Étape 1 · Import / Admin")
-st.session_state.setdefault("generated", None)   # {fiche, devis, lettre, metrics}
+st.session_state.setdefault("generated", None)
 st.session_state.setdefault("pdf_parsed", False)
+st.session_state.setdefault("pdf_applied", [])
+st.session_state.setdefault("gen_error", None)
 
 
 def add_line(code, desc="", unite="m²", qte=None, achat=None, vente=None):
-    """Ajoute une ligne à un corps de métier et initialise ses widgets.
-    Par défaut les valeurs numériques sont None : les champs s'affichent VIDES
-    (avec un placeholder gris), donc rien à effacer avant de saisir."""
     st.session_state.line_counter += 1
     lid = st.session_state.line_counter
     st.session_state.lots[code].append(lid)
@@ -503,38 +443,34 @@ def add_line(code, desc="", unite="m²", qte=None, achat=None, vente=None):
 
 
 def remove_line(code, lid):
-    """Supprime une ligne et nettoie ses clés de session."""
     if lid in st.session_state.lots[code]:
         st.session_state.lots[code].remove(lid)
     for suffix in ("desc", "unite", "qte", "achat", "vente"):
         st.session_state.pop(f"{code}_{lid}_{suffix}", None)
 
 
-# ----------------------------------------------------------------------------
-# 4.c bis — PERSISTANCE (mémoire) : on ne perd plus rien au rafraîchissement
-# ni au retour arrière du navigateur.
-# Principe : un identifiant unique de session est gardé dans l'URL (?sid=…),
-# qui survit au rechargement et aux boutons Précédent/Suivant du navigateur.
-# Tout l'état (champs admin + lignes chiffrées) est sauvegardé dans un petit
-# fichier JSON côté serveur, ré-injecté automatiquement au chargement suivant.
-# ----------------------------------------------------------------------------
+def clear_all_lines():
+    for code in list(st.session_state.lots):
+        for lid in list(st.session_state.lots[code]):
+            remove_line(code, lid)
+
+
+# ============================================================================
+# 6. PERSISTANCE (mémoire) — survit refresh / retour arrière
+# ============================================================================
 _SESS_DIR = os.path.join(tempfile.gettempdir(), "dossier_assurance_sessions")
 os.makedirs(_SESS_DIR, exist_ok=True)
-
-# Clés « simples » (valeurs scalaires) à mémoriser
 _PERSIST_KEYS = (list(PLACEHOLDERS.keys())
                  + ["zone_select", "expert_ht", "target_margin", "nav_step",
                     "pdf_parsed", "pdf_applied"])
 
 
 def _session_path(sid):
-    # Nom de fichier sécurisé (uniquement caractères alphanumériques)
     safe = re.sub(r"[^A-Za-z0-9]", "", sid)[:40]
     return os.path.join(_SESS_DIR, f"{safe}.json")
 
 
 def _build_snapshot():
-    """Photographie complète de l'état courant, sérialisable en JSON."""
     data = {k: st.session_state.get(k) for k in _PERSIST_KEYS}
     data["lots"] = {code: list(ids) for code, ids in st.session_state.lots.items()}
     data["line_counter"] = st.session_state.line_counter
@@ -550,7 +486,6 @@ def _build_snapshot():
 
 
 def save_session(sid):
-    """Écrit l'état courant sur disque (silencieux en cas d'échec)."""
     try:
         with open(_session_path(sid), "w", encoding="utf-8") as f:
             json.dump(_build_snapshot(), f, ensure_ascii=False)
@@ -559,7 +494,6 @@ def save_session(sid):
 
 
 def restore_session(sid):
-    """Ré-injecte un état précédemment sauvegardé. True si quelque chose restauré."""
     path = _session_path(sid)
     if not os.path.exists(path):
         return False
@@ -581,34 +515,61 @@ def restore_session(sid):
     return True
 
 
-# Récupère (ou crée) l'identifiant de session, persistant dans l'URL.
 _sid = st.query_params.get("sid")
 if not _sid:
     _sid = uuid.uuid4().hex[:12]
     st.query_params["sid"] = _sid
 st.session_state["_sid"] = _sid
 
-# Hydratation une seule fois par session Streamlit (donc ré-exécutée après un
-# rafraîchissement, qui crée une nouvelle session côté serveur).
 if not st.session_state.get("_hydrated"):
     st.session_state["_hydrated"] = True
     if restore_session(_sid):
-        # État retrouvé : on n'ajoute PAS de ligne vierge supplémentaire.
         st.session_state.seeded = True
 
-
-# 4.d — Au tout premier lancement : une seule ligne VIERGE pour montrer la
-# structure (placeholders gris). Aucune valeur pré-remplie à effacer.
+# Première visite : une ligne vierge pour montrer la structure.
 if "seeded" not in st.session_state:
     add_line("Platrerie")
     st.session_state.seeded = True
 
 
 # ============================================================================
-# 5. MOTEUR DE CALCUL
+# 7. CALLBACKS (exécutés AVANT le rendu des widgets → modifs sûres)
+# ============================================================================
+def cb_fill_demo():
+    for k, v in PLACEHOLDERS.items():
+        st.session_state[k] = v
+    st.session_state["zone_select"] = list(ZONES.keys())[1]
+    st.session_state["expert_ht"] = 7500.0
+    st.session_state["target_margin"] = 35.0
+    clear_all_lines()
+    add_line("Platrerie", "Reprise plâtrerie et enduits muraux", "m²", 25.0, 18.0, 32.0)
+    add_line("Plomberie", "Remplacement réseau eau froide", "ml", 12.0, 22.0, 45.0)
+    add_line("Sol", "Pose revêtement de sol PVC", "m²", 20.0, 15.0, 28.0)
+    st.session_state.seeded = True
+    st.toast("Données d'exemple chargées — vous pouvez générer le dossier.", icon="✨")
+
+
+def cb_reset_all():
+    for k in PLACEHOLDERS:
+        st.session_state[k] = ""
+    clear_all_lines()
+    st.session_state["expert_ht"] = 0.0
+    st.session_state.generated = None
+    st.session_state.pdf_parsed = False
+    st.session_state.pdf_applied = []
+    st.session_state.seeded = True
+    st.toast("Dossier réinitialisé.", icon="🧹")
+
+
+def cb_goto(target):
+    st.session_state.nav_step = target
+    st.session_state._scroll_top = True
+
+
+# ============================================================================
+# 8. MOTEUR DE CALCUL
 # ============================================================================
 def collect_lines():
-    """Reconstruit la liste à plat de toutes les lignes saisies (qte > 0)."""
     rows = []
     label_by_code = {code: label for label, code in CORPS_METIER}
     for _, code in CORPS_METIER:
@@ -621,44 +582,35 @@ def collect_lines():
             desc = st.session_state.get(f"{code}_{lid}_desc", "").strip()
             unite = st.session_state.get(f"{code}_{lid}_unite", "u")
             rows.append({
-                "corps": label_by_code[code].split(" ", 1)[-1],  # libellé lisible
+                "corps": label_by_code[code].split(" ", 1)[-1],
                 "desc": desc or label_by_code[code],
-                "unite": unite,
-                "qte": qte,
-                "achat": achat,
-                "vente": vente,
-                "total_achat": qte * achat,
-                "total_vente": qte * vente,
+                "unite": unite, "qte": qte, "achat": achat, "vente": vente,
+                "total_achat": qte * achat, "total_vente": qte * vente,
             })
     return rows
 
 
 def compute(rows, zone_coeff, expert_ht, target_margin):
-    """Agrège les totaux, la marge réelle et l'écart avec le plafond expert."""
     subtotal_vente = sum(r["total_vente"] for r in rows)
     total_achat = sum(r["total_achat"] for r in rows)
-
     final_ht = subtotal_vente * zone_coeff
     tva = final_ht * TVA_RATE
     ttc = final_ht + tva
-
     cost_total = total_achat * zone_coeff
     margin_eur = final_ht - cost_total
     margin_pct = (margin_eur / final_ht * 100.0) if final_ht > 0 else 0.0
-
     variance_eur = final_ht - expert_ht
     variance_pct = (variance_eur / expert_ht * 100.0) if expert_ht > 0 else 0.0
 
-    # Statut de conformité vis-à-vis du plafond expert
     if variance_pct <= 5.0:
         status, color = "CONFORME", SUCCESS
-        msg = "Le devis respecte parfaitement le plafond de l'expert. Prêt à l'envoi."
+        msg = "Le devis respecte le plafond de l'expert. Prêt à l'envoi."
     elif variance_pct <= 15.0:
         status, color = "VIGILANCE", WARNING
         msg = "Léger dépassement de l'enveloppe expert : une justification sera incluse dans la lettre."
     else:
         status, color = "HORS BUDGET", DANGER
-        msg = "Écart critique : risque de refus de l'assurance. Ajustez la marge ou vérifiez les métrés."
+        msg = "Écart critique : risque de refus. Ajustez la marge ou vérifiez les métrés."
 
     return {
         "subtotal_vente": subtotal_vente, "final_ht": final_ht, "tva": tva, "ttc": ttc,
@@ -671,129 +623,99 @@ def compute(rows, zone_coeff, expert_ht, target_margin):
 
 
 # ============================================================================
-# 6. GÉNÉRATION DES PDF (ReportLab)
+# 9. GÉNÉRATION DES PDF
 # ============================================================================
 def get_pdf_styles():
-    """Feuille de styles ReportLab cohérente avec la charte écran."""
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle("DocTitle", parent=styles["Heading1"],
-               fontName="Helvetica-Bold", fontSize=17, leading=21,
-               textColor=colors.HexColor(NAVY), alignment=TA_CENTER, spaceAfter=14))
-    styles.add(ParagraphStyle("SectionHeader", parent=styles["Heading2"],
-               fontName="Helvetica-Bold", fontSize=12, leading=16,
-               textColor=colors.HexColor(ANTHRACITE), spaceBefore=12, spaceAfter=8))
-    styles.add(ParagraphStyle("Body", parent=styles["Normal"],
-               fontName="Helvetica", fontSize=10, leading=14,
-               textColor=colors.HexColor("#333333"), alignment=TA_JUSTIFY, spaceAfter=10))
+    styles.add(ParagraphStyle("DocTitle", parent=styles["Heading1"], fontName="Helvetica-Bold",
+               fontSize=17, leading=21, textColor=colors.HexColor(NAVY), alignment=TA_CENTER, spaceAfter=14))
+    styles.add(ParagraphStyle("SectionHeader", parent=styles["Heading2"], fontName="Helvetica-Bold",
+               fontSize=12, leading=16, textColor=colors.HexColor("#1E293B"), spaceBefore=12, spaceAfter=8))
+    styles.add(ParagraphStyle("Body", parent=styles["Normal"], fontName="Helvetica", fontSize=10,
+               leading=14, textColor=colors.HexColor("#333333"), alignment=TA_JUSTIFY, spaceAfter=10))
     styles.add(ParagraphStyle("BodyBold", parent=styles["Body"], fontName="Helvetica-Bold"))
-    styles.add(ParagraphStyle("Right", parent=styles["Normal"],
-               fontName="Helvetica", fontSize=10, leading=14, alignment=TA_RIGHT))
-    styles.add(ParagraphStyle("Confidential", parent=styles["Normal"],
-               fontName="Helvetica-Bold", fontSize=11, leading=14,
-               textColor=colors.HexColor(DANGER), alignment=TA_CENTER, spaceAfter=10))
+    styles.add(ParagraphStyle("Right", parent=styles["Normal"], fontName="Helvetica", fontSize=10,
+               leading=14, alignment=TA_RIGHT))
+    styles.add(ParagraphStyle("Confidential", parent=styles["Normal"], fontName="Helvetica-Bold",
+               fontSize=11, leading=14, textColor=colors.HexColor(DANGER), alignment=TA_CENTER, spaceAfter=10))
     return styles
 
 
-def _company_header_paragraph(d, styles):
-    """En-tête entreprise réutilisable, alimenté dynamiquement par le SIRET saisi."""
+def _company_header(d, s):
     return Paragraph(
         f"<b>{d['company_name']}</b><br/>{d['company_address']}<br/>"
-        f"SIRET : {d['company_siret']} &nbsp;|&nbsp; TVA : {d['company_tva']}",
-        styles["Body"],
-    )
+        f"SIRET : {d['company_siret']} &nbsp;|&nbsp; TVA : {d['company_tva']}", s["Body"])
 
 
 def build_fiche_interne(d, rows, calc):
-    """PDF 1 — Fiche interne confidentielle : coûts de revient vs barème, marge."""
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=45, rightMargin=45,
-                            topMargin=45, bottomMargin=45)
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=40, rightMargin=40, topMargin=45, bottomMargin=45)
     s = get_pdf_styles()
     story = [
         Paragraph("DOCUMENT INTERNE STRICTEMENT CONFIDENTIEL", s["Confidential"]),
         Paragraph("FICHE DE PRÉPARATION & ANALYSE DE RENTABILITÉ CHANTIER", s["DocTitle"]),
         Spacer(1, 12),
     ]
-
     info = [
-        [Paragraph("<b>PROJET & CLIENT</b>", s["BodyBold"]),
-         Paragraph("<b>RÉFÉRENCES SINISTRE</b>", s["BodyBold"])],
+        [Paragraph("<b>PROJET & CLIENT</b>", s["BodyBold"]), Paragraph("<b>RÉFÉRENCES SINISTRE</b>", s["BodyBold"])],
         [Paragraph(f"Assuré : {d['client_name']}<br/>Adresse : {d['address']}", s["Body"]),
          Paragraph(f"Compagnie : {d['insurance_name']}<br/>N° Sinistre : {d['claim_number']}"
                    f"<br/>Expert : {d['expert_name']} ({d['expert_ref']})", s["Body"])],
     ]
-    t = Table(info, colWidths=[250, 250])
+    t = Table(info, colWidths=[257, 258])
     t.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EAEDED")),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#BDC3C7")),
         ("PADDING", (0, 0), (-1, -1), 8), ("VALIGN", (0, 0), (-1, -1), "TOP"),
     ]))
-    story += [t, Spacer(1, 18),
-              Paragraph("Analyse financière détaillée et coûts de revient", s["SectionHeader"])]
+    story += [t, Spacer(1, 18), Paragraph("Analyse financière détaillée et coûts de revient", s["SectionHeader"])]
 
     data = [["Poste", "Qté", "Revient unit.", "Total revient", "Revente unit.", "Total revente"]]
     for r in rows:
-        data.append([
-            r["desc"], f"{r['qte']:g} {r['unite']}",
-            format_currency(r["achat"]), format_currency(r["total_achat"]),
-            format_currency(r["vente"]), format_currency(r["total_vente"]),
-        ])
+        data.append([r["desc"], f"{r['qte']:g} {r['unite']}",
+                     format_currency(r["achat"]), format_currency(r["total_achat"]),
+                     format_currency(r["vente"]), format_currency(r["total_vente"])])
     data.append(["SOUS-TOTAL (barème)", "", "", format_currency(calc["total_achat"]),
                  "", format_currency(calc["subtotal_vente"])])
     data.append([f"Ajustement zone (×{calc['zone_coeff']:g})", "", "",
-                 format_currency(calc["cost_total"]), "",
-                 format_currency(calc["final_ht"])])
+                 format_currency(calc["cost_total"]), "", format_currency(calc["final_ht"])])
     data.append(["TOTAL GÉNÉRAL HT", "", "", format_currency(calc["cost_total"]),
                  "", format_currency(calc["final_ht"])])
-
-    t = Table(data, colWidths=[150, 55, 75, 75, 75, 75])
+    t = Table(data, colWidths=[150, 50, 78, 78, 78, 81])
     t.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(ANTHRACITE)),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1E293B")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("ALIGN", (0, 0), (-1, 0), "CENTER"),
-        ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+        ("ALIGN", (0, 0), (-1, 0), "CENTER"), ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#BDC3C7")),
         ("FONTNAME", (0, -3), (-1, -1), "Helvetica-Bold"),
         ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#F2F4F4")),
         ("PADDING", (0, 0), (-1, -1), 6), ("FONTSIZE", (0, 0), (-1, -1), 8.5),
     ]))
-    story += [t, Spacer(1, 18),
-              Paragraph("Indicateurs de rentabilité stratégique", s["SectionHeader"])]
-
-    perf = (
-        f"<b>Coût de revient total brut :</b> {format_currency(calc['cost_total'])}<br/>"
-        f"<b>Chiffre d'affaires prévisionnel HT :</b> {format_currency(calc['final_ht'])}<br/>"
-        f"<b>Marge commerciale réelle dégagée :</b> {format_currency(calc['margin_eur'])}<br/>"
-        f"<b>Taux de marge réelle :</b> {calc['margin_pct']:.2f} % "
-        f"<i>(objectif cible : {calc['target_margin']:.2f} %)</i>"
-    )
+    story += [t, Spacer(1, 18), Paragraph("Indicateurs de rentabilité stratégique", s["SectionHeader"])]
+    perf = (f"<b>Coût de revient total brut :</b> {format_currency(calc['cost_total'])}<br/>"
+            f"<b>Chiffre d'affaires prévisionnel HT :</b> {format_currency(calc['final_ht'])}<br/>"
+            f"<b>Marge commerciale réelle dégagée :</b> {format_currency(calc['margin_eur'])}<br/>"
+            f"<b>Taux de marge réelle :</b> {calc['margin_pct']:.2f} % "
+            f"<i>(objectif cible : {calc['target_margin']:.2f} %)</i>")
     story.append(Paragraph(perf, s["Body"]))
     if calc["margin_pct"] < calc["target_margin"]:
         story += [Spacer(1, 8), Paragraph(
-            "⚠️ ALERTE RENTABILITÉ : la marge réelle est inférieure à votre objectif cible. "
-            "Surveillez attentivement les coûts d'exécution sur le chantier.", s["Confidential"])]
-
+            "⚠️ ALERTE RENTABILITÉ : la marge réelle est inférieure à votre objectif cible.", s["Confidential"])]
     doc.build(story)
     buf.seek(0)
     return buf.getvalue()
 
 
 def build_devis_conforme(d, rows, calc):
-    """PDF 2 — Devis officiel conforme, en-tête entité (SIRET dynamique)."""
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=45, rightMargin=45,
-                            topMargin=45, bottomMargin=45)
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=40, rightMargin=40, topMargin=45, bottomMargin=45)
     s = get_pdf_styles()
-    story = []
-
-    head = [[_company_header_paragraph(d, s),
+    head = [[_company_header(d, s),
              Paragraph(f"<b>DEVIS OFFICIEL</b><br/>N° DEV-{datetime.date.today():%Y%m}-01"
-                       f"<br/>Date : {datetime.date.today():%d/%m/%Y}<br/>Validité : 90 jours",
-                       s["Right"])]]
-    story += [Table(head, colWidths=[300, 200]), Spacer(1, 16),
-              Paragraph("DEVIS DE RÉFECTION CONFORME APRÈS SINISTRE", s["DocTitle"]), Spacer(1, 8)]
-
+                       f"<br/>Date : {datetime.date.today():%d/%m/%Y}<br/>Validité : 90 jours", s["Right"])]]
+    story = [Table(head, colWidths=[315, 200]), Spacer(1, 16),
+             Paragraph("DEVIS DE RÉFECTION CONFORME APRÈS SINISTRE", s["DocTitle"]), Spacer(1, 8)]
     client = [
         [Paragraph("<b>DESTINATAIRE / ASSURÉ</b>", s["BodyBold"]),
          Paragraph("<b>CONTEXTE SINISTRE & EXPERTISE</b>", s["BodyBold"])],
@@ -801,21 +723,18 @@ def build_devis_conforme(d, rows, calc):
          Paragraph(f"Compagnie : {d['insurance_name']}<br/>N° Sinistre : {d['claim_number']}"
                    f"<br/>Cabinet : {d['expert_name']}<br/>Réf. expert : {d['expert_ref']}", s["Body"])],
     ]
-    t = Table(client, colWidths=[250, 250])
+    t = Table(client, colWidths=[257, 258])
     t.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(ANTHRACITE)),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1E293B")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#BDC3C7")),
         ("PADDING", (0, 0), (-1, -1), 8), ("VALIGN", (0, 0), (-1, -1), "TOP"),
     ]))
-    story += [t, Spacer(1, 18),
-              Paragraph("Désignation des travaux de réfection", s["SectionHeader"])]
-
+    story += [t, Spacer(1, 18), Paragraph("Désignation des travaux de réfection", s["SectionHeader"])]
     data = [["Désignation des travaux", "Quantité", "Prix unitaire HT", "Montant HT"]]
     for r in rows:
         data.append([f"[{r['corps']}] {r['desc']}", f"{r['qte']:g} {r['unite']}",
                      format_currency(r["vente"]), format_currency(r["total_vente"])])
-
     maj_pct = int(round((calc["zone_coeff"] - 1) * 100))
     zone_txt = (f"Ajustement géographique (+{maj_pct} %)" if maj_pct > 0
                 else "Ajustement géographique (sans majoration)")
@@ -826,246 +745,195 @@ def build_devis_conforme(d, rows, calc):
         [f"TVA ({TVA_RATE*100:.2f} %)", "", "", format_currency(calc["tva"])],
         ["TOTAL TTC", "", "", format_currency(calc["ttc"])],
     ]
-
-    t = Table(data, colWidths=[270, 70, 80, 80])
+    t = Table(data, colWidths=[275, 70, 85, 85])
     style = [
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(ANTHRACITE)),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1E293B")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("ALIGN", (0, 0), (-1, 0), "CENTER"),
-        ("ALIGN", (1, 1), (-1, -1), "RIGHT"), ("ALIGN", (0, 1), (0, -1), "LEFT"),
+        ("ALIGN", (0, 0), (-1, 0), "CENTER"), ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+        ("ALIGN", (0, 1), (0, -1), "LEFT"),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#BDC3C7")),
         ("PADDING", (0, 0), (-1, -1), 6), ("FONTSIZE", (0, 0), (-1, -1), 9),
         ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#EAECEE")),
     ]
-    for i in range(len(data) - 5, len(data)):  # gras sur les lignes de totaux
+    for i in range(len(data) - 5, len(data)):
         style.append(("FONTNAME", (0, i), (-1, i), "Helvetica-Bold"))
     t.setStyle(TableStyle(style))
-    story += [t, Spacer(1, 36)]
-
-    sig = [[Paragraph("<b>Cadre réservé à l'entreprise</b><br/>Pour la direction technique<br/>"
-                      "Bon pour exécution", s["Body"]),
-            Paragraph("<b>Bon pour accord client / compagnie</b><br/>Date, signature et mention<br/>"
-                      "« Lu et approuvé – Bon pour accord »", s["Body"])]]
-    t = Table(sig, colWidths=[250, 250])
+    story += [t, Spacer(1, 30)]
+    sig = [[Paragraph("<b>Cadre réservé à l'entreprise</b><br/>Pour la direction technique<br/>Bon pour exécution", s["Body"]),
+            Paragraph("<b>Bon pour accord client / compagnie</b><br/>Date, signature et mention<br/>« Lu et approuvé – Bon pour accord »", s["Body"])]]
+    t = Table(sig, colWidths=[257, 258])
     t.setStyle(TableStyle([("LINEABOVE", (0, 0), (-1, 0), 0.5, colors.HexColor("#7F8C8D")),
                            ("PADDING", (0, 0), (-1, -1), 10), ("VALIGN", (0, 0), (-1, -1), "TOP")]))
     story.append(t)
-
     doc.build(story)
     buf.seek(0)
     return buf.getvalue()
 
 
 def build_lettre_expert(d, rows, calc):
-    """PDF 3 — Lettre d'accompagnement à l'expert, paragraphe conditionnel par statut."""
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=50, rightMargin=50,
-                            topMargin=50, bottomMargin=50)
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=50, rightMargin=50, topMargin=50, bottomMargin=50)
     s = get_pdf_styles()
-    story = [_company_header_paragraph(d, s), Spacer(1, 14)]
-
-    dest = (f"<b>Cabinet d'expertise :</b> {d['expert_name']}<br/>"
-            f"À l'attention de l'expert en charge<br/>"
-            f"<b>Réf. dossier :</b> {d['expert_ref']}")
-    story += [Table([[Spacer(1, 1), Paragraph(dest, s["Body"])]], colWidths=[250, 250]),
-              Spacer(1, 18),
-              Paragraph(f"Fait à Paris, le {datetime.date.today():%d/%m/%Y}", s["Right"]),
-              Spacer(1, 12)]
-
+    story = [_company_header(d, s), Spacer(1, 14)]
+    dest = (f"<b>Cabinet d'expertise :</b> {d['expert_name']}<br/>À l'attention de l'expert en charge"
+            f"<br/><b>Réf. dossier :</b> {d['expert_ref']}")
+    story += [Table([[Spacer(1, 1), Paragraph(dest, s["Body"])]], colWidths=[245, 250]), Spacer(1, 18),
+              Paragraph(f"Fait à Paris, le {datetime.date.today():%d/%m/%Y}", s["Right"]), Spacer(1, 12)]
     obj = (f"<b>Objet :</b> Proposition de chiffrage de réfection suite à sinistre<br/>"
-           f"<b>N° de sinistre :</b> {d['claim_number']}<br/>"
-           f"<b>Assuré :</b> {d['client_name']}<br/>"
+           f"<b>N° de sinistre :</b> {d['claim_number']}<br/><b>Assuré :</b> {d['client_name']}<br/>"
            f"<b>Adresse :</b> {d['address']}")
     story += [Paragraph(obj, s["Body"]), Spacer(1, 12),
               Paragraph("Madame, Monsieur l'Expert,", s["Body"]), Spacer(1, 6)]
-
     story.append(Paragraph(
-        "Dans le cadre du dossier référencé ci-dessus, nous avons l'honneur de vous soumettre "
-        "notre proposition de chiffrage pour les travaux de remise en état. Notre étude a été "
-        "dressée en respectant les métrés et volumes d'intervention validés lors de votre expertise.",
-        s["Body"]))
+        "Dans le cadre du dossier référencé ci-dessus, nous avons l'honneur de vous soumettre notre "
+        "proposition de chiffrage pour les travaux de remise en état, dressée en respectant les métrés "
+        "et volumes validés lors de votre expertise.", s["Body"]))
     story.append(Paragraph(
         f"Notre devis s'établit à un montant total de <b>{format_currency(calc['final_ht'])} HT</b>, "
-        f"soit <b>{format_currency(calc['ttc'])} TTC</b> après application de la TVA réglementaire "
-        f"de {TVA_RATE*100:.0f} % dédiée aux travaux de rénovation après sinistre.", s["Body"]))
-
-    # Paragraphe conditionnel selon la conformité budgétaire
+        f"soit <b>{format_currency(calc['ttc'])} TTC</b> après application de la TVA réglementaire de "
+        f"{TVA_RATE*100:.0f} % dédiée aux travaux de rénovation après sinistre.", s["Body"]))
     if calc["status"] == "VIGILANCE":
-        cond = ("<b>Note de justification technique :</b> ce chiffrage présente un léger ajustement "
-                "par rapport à votre première enveloppe estimative, motivé par les spécificités des "
-                "supports identifiés et par les contraintes géographiques et logistiques du chantier, "
-                "justifiant l'application de notre barème actualisé de zone.")
+        cond = ("<b>Note de justification technique :</b> ce chiffrage présente un léger ajustement par "
+                "rapport à votre première enveloppe, motivé par les spécificités des supports identifiés "
+                "et les contraintes géographiques du chantier.")
     elif calc["status"] == "HORS BUDGET":
         cond = ("<b>Note d'analyse de conformité budgétaire :</b> constatant un écart significatif avec "
-                "l'évaluation initiale, nous précisons que les contraintes d'exécution réelles et les "
-                "exigences de mise en œuvre imposent cette réévaluation. Nous sollicitons une révision "
-                "bienveillante du dossier afin de permettre un démarrage rapide des travaux dans "
-                "l'intérêt de l'assuré.")
+                "l'évaluation initiale, les contraintes d'exécution réelles imposent cette réévaluation. "
+                "Nous sollicitons une révision bienveillante du dossier dans l'intérêt de l'assuré.")
     else:
         cond = ("Nous constatons avec satisfaction que notre proposition s'inscrit en parfaite adéquation "
-                "avec vos évaluations initiales, ce qui démontre la stricte conformité technique de notre "
-                "offre par rapport aux attendus de votre cabinet.")
-    story += [Spacer(1, 4), Paragraph(cond, s["Body"]), Spacer(1, 8)]
-
-    story += [
-        Paragraph("Nous restons à votre entière disposition pour tout justificatif complémentaire "
-                  "nécessaire à la validation définitive de ce dossier d'indemnisation.", s["Body"]),
-        Spacer(1, 6),
-        Paragraph("Veuillez agréer, Madame, Monsieur l'Expert, l'expression de nos salutations "
-                  "distinguées.", s["Body"]),
-        Spacer(1, 28),
-        Paragraph(f"<b>{d['company_name']}</b><br/>Département de réhabilitation après sinistre", s["Body"]),
-    ]
-
+                "avec vos évaluations initiales, démontrant la stricte conformité technique de notre offre.")
+    story += [Spacer(1, 4), Paragraph(cond, s["Body"]), Spacer(1, 8),
+              Paragraph("Nous restons à votre disposition pour tout justificatif complémentaire nécessaire "
+                        "à la validation de ce dossier d'indemnisation.", s["Body"]), Spacer(1, 6),
+              Paragraph("Veuillez agréer, Madame, Monsieur l'Expert, l'expression de nos salutations "
+                        "distinguées.", s["Body"]), Spacer(1, 28),
+              Paragraph(f"<b>{d['company_name']}</b><br/>Département de réhabilitation après sinistre", s["Body"])]
     doc.build(story)
     buf.seek(0)
     return buf.getvalue()
 
 
+def generate_all(rows, calc):
+    """Génère les 3 PDF. Renseigne gen_error en cas d'échec (jamais de crash)."""
+    d = {k: (st.session_state[k].strip() or PLACEHOLDERS.get(k, ""))
+         for k in ("company_name", "company_address", "company_siret", "company_tva",
+                   "client_name", "address", "insurance_name", "claim_number",
+                   "expert_name", "expert_ref")}
+    try:
+        st.session_state.generated = {
+            "fiche": build_fiche_interne(d, rows, calc),
+            "devis": build_devis_conforme(d, rows, calc),
+            "lettre": build_lettre_expert(d, rows, calc),
+            "claim": d["claim_number"] or "dossier",
+        }
+        st.session_state.gen_error = None
+        return True
+    except Exception:
+        st.session_state.generated = None
+        st.session_state.gen_error = traceback.format_exc(limit=3)
+        return False
+
+
 # ============================================================================
-# 7. COMPOSANTS D'INTERFACE RÉUTILISABLES
+# 10. COMPOSANTS UI
 # ============================================================================
 def kpi_card(label, value, sub="", accent=None):
-    """Carte KPI high-tech. `accent` (optionnel) colore le liseré supérieur."""
     style = f"--kpi-accent:{accent};" if accent else ""
-    return f"""
-    <div class="kpi" style="{style}">
-        <div class="label">{label}</div>
-        <div class="value">{value}</div>
-        <div class="sub">{sub}</div>
-    </div>"""
+    return (f'<div class="kpi" style="{style}"><div class="label">{label}</div>'
+            f'<div class="value">{value}</div><div class="sub">{sub}</div></div>')
 
 
 def status_banner(calc):
-    """Bandeau de statut de conformité coloré."""
-    st.markdown(f"""
-    <div class="status-box" style="background:{calc['color']}1A; border-left:6px solid {calc['color']};">
-        <h4 style="color:{calc['color']};">Statut du dossier : {calc['status']}</h4>
-        <p>{calc['msg']}</p>
-    </div>""", unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="status-box" style="background:{calc["color"]}1A; border-left:6px solid {calc["color"]};">'
+        f'<h4 style="color:{calc["color"]};">Statut du dossier : {calc["status"]}</h4>'
+        f'<p>{calc["msg"]}</p></div>', unsafe_allow_html=True)
 
 
-# --- Définition des étapes du workflow (ordre = navigation) ---
-STEPS = [
-    "Étape 1 · Import / Admin",
-    "Étape 2 · Chiffrage par lots",
-    "Étape 3 · Génération & Dashboard",
-]
+STEPS = ["Étape 1 · Import / Admin", "Étape 2 · Chiffrage par lots", "Étape 3 · Génération & Dashboard"]
 STEP_TITLES = ["Import / Admin", "Chiffrage par lots", "Génération & Dashboard"]
 
 
-def _goto_step(target):
-    """Callback de navigation : change l'étape et demande un défilement en haut."""
-    st.session_state.nav_step = target
-    st.session_state._scroll_top = True
-
-
 def render_breadcrumb(active_index):
-    """Fil d'Ariane visuel 1 → 2 → 3 + barre de progression animée."""
-    # Barre de progression (proportionnelle à l'étape courante)
     pct = int((active_index + 1) / len(STEPS) * 100)
-    st.markdown(f"<div class='tech-progress'><span style='width:{pct}%'></span></div>",
-                unsafe_allow_html=True)
+    st.markdown(f"<div class='tech-progress'><span style='width:{pct}%'></span></div>", unsafe_allow_html=True)
     items = ""
     for i, title in enumerate(STEP_TITLES):
-        if i == active_index:
-            cls = "crumb active"
-        elif i < active_index:
-            cls = "crumb done"
-        else:
-            cls = "crumb"
+        cls = "crumb active" if i == active_index else ("crumb done" if i < active_index else "crumb")
         mark = "✓" if i < active_index else str(i + 1)
         items += f"<div class='{cls}'><span class='n'>{mark}</span><span class='t'>{title}</span></div>"
     st.markdown(f"<div class='crumbs'>{items}</div>", unsafe_allow_html=True)
 
 
 def render_nav_buttons(active_index):
-    """Boutons « Précédent » / « Suivant » en bas de chaque étape."""
     st.divider()
-    prev_c, mid_c, next_c = st.columns([1, 2, 1])
+    prev_c, _, next_c = st.columns([1, 2, 1])
     if active_index > 0:
-        prev_c.button("← Étape précédente", width="stretch",
-                      on_click=_goto_step, args=(STEPS[active_index - 1],),
-                      key=f"prev_{active_index}")
+        prev_c.button("← Étape précédente", width="stretch", on_click=cb_goto,
+                      args=(STEPS[active_index - 1],), key=f"prev_{active_index}")
     if active_index < len(STEPS) - 1:
-        next_c.button("Étape suivante →", type="primary", width="stretch",
-                      on_click=_goto_step, args=(STEPS[active_index + 1],),
-                      key=f"next_{active_index}")
+        next_c.button("Étape suivante →", type="primary", width="stretch", on_click=cb_goto,
+                      args=(STEPS[active_index + 1],), key=f"next_{active_index}")
 
 
 def scroll_to_top_if_needed():
-    """Fait défiler la page en haut juste après un changement d'étape."""
     if st.session_state.pop("_scroll_top", False):
         components.html(
-            """
-            <script>
-                const doc = window.parent.document;
-                const target = doc.querySelector('section.main')
-                            || doc.querySelector('[data-testid="stMain"]')
-                            || doc.scrollingElement || doc.documentElement;
-                if (target) { target.scrollTo({top: 0, behavior: 'smooth'}); }
-                window.parent.scrollTo({top: 0, behavior: 'smooth'});
-            </script>
-            """,
-            height=0,
-        )
+            "<script>const d=window.parent.document;"
+            "const t=d.querySelector('section.main')||d.querySelector('[data-testid=\"stMain\"]')"
+            "||d.scrollingElement||d.documentElement;"
+            "if(t){t.scrollTo({top:0,behavior:'smooth'});}"
+            "window.parent.scrollTo({top:0,behavior:'smooth'});</script>", height=0)
 
 
 # ============================================================================
-# 8. EN-TÊTE & NAVIGATION (SIDEBAR)
+# 11. EN-TÊTE & SIDEBAR
 # ============================================================================
-st.markdown(f"""
-<div class="hero">
-    <span class="live"><span class="dot"></span> SYSTÈME OPÉRATIONNEL</span>
-    <h1>🏛️ Gestionnaire Stratégique de Sinistres</h1>
-    <p>Chiffrage par corps de métier · Analyse de marge · Conformité expert · Génération documentaire</p>
-</div>""", unsafe_allow_html=True)
+st.markdown(
+    '<div class="hero"><span class="orb a"></span><span class="orb b"></span>'
+    '<span class="live"><span class="dot"></span> SYSTÈME OPÉRATIONNEL</span>'
+    '<h1>🏛️ Gestionnaire Stratégique de Sinistres</h1>'
+    '<p>Chiffrage par corps de métier · Analyse de marge · Conformité expert · Génération documentaire</p>'
+    '</div>', unsafe_allow_html=True)
 
 with st.sidebar:
     st.markdown("### 🧭 Navigation")
     st.radio("Étapes du workflow", STEPS, key="nav_step", label_visibility="collapsed")
-
     st.divider()
-
-    # Récapitulatif live (mis à jour à chaque interaction)
     _rows = collect_lines()
     _zc = ZONES[st.session_state["zone_select"]]
     _calc = compute(_rows, _zc, st.session_state["expert_ht"], st.session_state["target_margin"])
     st.markdown("### 📊 Récapitulatif live")
     st.metric("Total HT proposé", format_currency(_calc["final_ht"]))
-    st.metric("Marge réelle", f"{_calc['margin_pct']:.1f} %",
-              f"{format_currency(_calc['margin_eur'])}")
+    st.metric("Marge réelle", f"{_calc['margin_pct']:.1f} %", f"{format_currency(_calc['margin_eur'])}")
     st.caption(f"{len(_rows)} ligne(s) active(s) · Zone ×{_zc:g}")
+    st.divider()
+    st.button("✨ Charger un exemple complet", on_click=cb_fill_demo, width="stretch", key="demo_btn")
+    st.button("🧹 Réinitialiser le dossier", on_click=cb_reset_all, width="stretch", key="reset_btn")
 
 
 # ============================================================================
-# 9. ÉTAPE 1 — IMPORT / ADMIN
+# 12. ÉTAPE 1 — IMPORT / ADMIN
 # ============================================================================
 def render_step1():
     st.subheader("Étape 1 — Import du rapport & informations administratives")
 
-    # --- Bloc import PDF (extraction automatique) ---
-    with st.container():
-        st.markdown('<div class="card">', unsafe_allow_html=True)
+    with st.container(border=True):
         st.markdown("##### 📂 Import du rapport d'expertise (optionnel)")
         if not PDFPLUMBER_OK:
-            st.caption("Module d'extraction PDF indisponible (pdfplumber non installé) — "
-                       "la saisie manuelle ci-dessous reste pleinement opérationnelle.")
+            st.caption("Module d'extraction PDF indisponible — la saisie manuelle reste opérationnelle.")
         up = st.file_uploader("Déposez le rapport PDF pour pré-remplir les champs", type=["pdf"])
         if up is not None and not st.session_state.pdf_parsed:
             with st.spinner("Analyse du document et extraction des données clés…"):
                 info = extract_data_from_pdf(up)
-            # On remplit TOUS les champs reconnus (pas seulement 3).
-            fillable = ("claim_number", "expert_ref", "expert_name",
-                        "insurance_name", "client_name", "address", "expert_ht")
+            labels = {"claim_number": "N° sinistre", "expert_ref": "Réf. expert",
+                      "expert_name": "Cabinet", "insurance_name": "Compagnie",
+                      "client_name": "Assuré", "address": "Adresse", "expert_ht": "Plafond HT"}
             applied = []
-            labels = {
-                "claim_number": "N° sinistre", "expert_ref": "Réf. expert",
-                "expert_name": "Cabinet d'expertise", "insurance_name": "Compagnie",
-                "client_name": "Assuré", "address": "Adresse", "expert_ht": "Plafond HT",
-            }
-            for key in fillable:
+            for key in ("claim_number", "expert_ref", "expert_name", "insurance_name",
+                        "client_name", "address", "expert_ht"):
                 if info.get(key):
                     st.session_state[key] = info[key]
                     applied.append(labels[key])
@@ -1077,131 +945,91 @@ def render_step1():
             if applied:
                 st.success("Champs pré-remplis depuis le PDF : " + ", ".join(applied) + " ✔")
             else:
-                st.info("Aucune donnée exploitable détectée automatiquement. "
-                        "Complétez les champs manuellement ci-dessous.")
+                st.info("Aucune donnée exploitable détectée — complétez les champs manuellement.")
             if st.button("↻ Réinitialiser l'import PDF"):
                 st.session_state.pdf_parsed = False
-                st.session_state.pop("pdf_applied", None)
+                st.session_state.pdf_applied = []
                 st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
 
-    # --- Bloc entité émettrice (le SIRET alimente l'en-tête des PDF) ---
-    st.markdown("##### 🏢 Entité émettrice (conformité légale du devis)")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.text_input("Raison sociale", key="company_name",
-                      placeholder=PLACEHOLDERS["company_name"])
-        st.text_input("Adresse du siège", key="company_address",
-                      placeholder=PLACEHOLDERS["company_address"])
-    with c2:
-        st.text_input("Numéro SIRET", key="company_siret", max_chars=20,
-                      placeholder=PLACEHOLDERS["company_siret"],
-                      help="14 chiffres. Les espaces et tirets sont acceptés.")
-        st.text_input("N° TVA intracommunautaire", key="company_tva",
-                      placeholder=PLACEHOLDERS["company_tva"])
+    with st.container(border=True):
+        st.markdown("##### 🏢 Entité émettrice (conformité légale du devis)")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.text_input("Raison sociale", key="company_name", placeholder=PLACEHOLDERS["company_name"])
+            st.text_input("Adresse du siège", key="company_address", placeholder=PLACEHOLDERS["company_address"])
+        with c2:
+            st.text_input("Numéro SIRET", key="company_siret", max_chars=20,
+                          placeholder=PLACEHOLDERS["company_siret"], help="14 chiffres ; espaces et tirets acceptés.")
+            st.text_input("N° TVA intracommunautaire", key="company_tva", placeholder=PLACEHOLDERS["company_tva"])
+        siret = st.session_state["company_siret"].strip()
+        if siret == "":
+            st.caption("Le SIRET sera repris tel quel dans l'en-tête des documents.")
+        elif validate_siret(siret):
+            st.caption("✅ SIRET valide — repris dans l'en-tête de chaque document.")
+        else:
+            st.info("ℹ️ Format SIRET inhabituel (14 chiffres attendus). La génération reste possible.")
 
-    # Le SIRET accepte espaces et tirets (max_chars élargi). La validation est
-    # purement INDICATIVE : elle n'empêche jamais la génération des documents.
-    if st.session_state["company_siret"].strip() == "":
-        st.caption("Le SIRET sera repris tel quel dans l'en-tête des documents.")
-    elif validate_siret(st.session_state["company_siret"]):
-        st.caption("✅ SIRET valide — repris automatiquement dans l'en-tête de chaque document.")
-    else:
-        st.info("ℹ️ Format SIRET inhabituel (14 chiffres attendus). "
-                "Vous pouvez tout de même générer vos documents.")
-
-    st.divider()
-
-    # --- Bloc dossier / sinistre / expert ---
-    st.markdown("##### 📁 Dossier client & sinistre")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.text_input("Nom de l'assuré *", key="client_name",
-                      placeholder=PLACEHOLDERS["client_name"])
-        st.text_input("Adresse du chantier *", key="address",
-                      placeholder=PLACEHOLDERS["address"])
-    with c2:
-        st.text_input("Compagnie d'assurance *", key="insurance_name",
-                      placeholder=PLACEHOLDERS["insurance_name"])
-        st.text_input("Numéro de sinistre *", key="claim_number",
-                      placeholder=PLACEHOLDERS["claim_number"])
-    with c3:
-        st.text_input("Cabinet d'expertise *", key="expert_name",
-                      placeholder=PLACEHOLDERS["expert_name"])
-        st.text_input("Référence rapport expert *", key="expert_ref",
-                      placeholder=PLACEHOLDERS["expert_ref"])
-
-    st.markdown("##### 🌍 Zone géographique")
-    zc1, _ = st.columns([1, 2])
-    with zc1:
-        st.selectbox("Coefficient géographique", list(ZONES.keys()), key="zone_select",
-                     help="Zone A ×1,00 · Zone B ×1,15 · Zone C ×1,25")
+    with st.container(border=True):
+        st.markdown("##### 📁 Dossier client & sinistre")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.text_input("Nom de l'assuré *", key="client_name", placeholder=PLACEHOLDERS["client_name"])
+            st.text_input("Adresse du chantier *", key="address", placeholder=PLACEHOLDERS["address"])
+        with c2:
+            st.text_input("Compagnie d'assurance *", key="insurance_name", placeholder=PLACEHOLDERS["insurance_name"])
+            st.text_input("Numéro de sinistre *", key="claim_number", placeholder=PLACEHOLDERS["claim_number"])
+        with c3:
+            st.text_input("Cabinet d'expertise *", key="expert_name", placeholder=PLACEHOLDERS["expert_name"])
+            st.text_input("Référence rapport expert *", key="expert_ref", placeholder=PLACEHOLDERS["expert_ref"])
+        st.markdown("**🌍 Zone géographique**")
+        zc1, _ = st.columns([1, 2])
+        zc1.selectbox("Coefficient géographique", list(ZONES.keys()), key="zone_select",
+                      help="Zone A ×1,00 · Zone B ×1,15 · Zone C ×1,25")
 
     st.info("Passez à l'**Étape 2** (menu de gauche) pour chiffrer les travaux par corps de métier.")
 
 
 # ============================================================================
-# 10. ÉTAPE 2 — CHIFFRAGE PAR LOTS (dynamique, temps réel)
+# 13. ÉTAPE 2 — CHIFFRAGE PAR LOTS
 # ============================================================================
 def render_step2():
     st.subheader("Étape 2 — Chiffrage par corps de métier")
-    st.caption("Chaque lot est facultatif. Dépliez un corps de métier et cliquez sur "
-               "« ➕ Ajouter une ligne » pour le chiffrer. Les totaux se recalculent en temps réel.")
-
-    label_by_code = {code: label for label, code in CORPS_METIER}
+    st.caption("Chaque lot est facultatif. Dépliez un corps de métier et ajoutez des lignes. "
+               "Les totaux se recalculent en temps réel.")
 
     for label, code in CORPS_METIER:
         ids = st.session_state.lots[code]
-        # Total du lot pour l'afficher dans le titre de l'expander
-        lot_total = sum(
-            float(st.session_state.get(f"{code}_{i}_qte", 0) or 0)
-            * float(st.session_state.get(f"{code}_{i}_vente", 0) or 0)
-            for i in ids
-        )
+        lot_total = sum(float(st.session_state.get(f"{code}_{i}_qte", 0) or 0)
+                        * float(st.session_state.get(f"{code}_{i}_vente", 0) or 0) for i in ids)
         suffix = f"  —  {len(ids)} ligne(s) · {format_currency(lot_total)}" if ids else "  —  vide"
         with st.expander(label + suffix, expanded=bool(ids)):
-
-            # En-tête de colonnes (affiché seulement s'il y a des lignes)
             if ids:
                 h = st.columns([3, 1.1, 1, 1.3, 1.3, 1.5, 0.6])
                 for col, name in zip(h, ["Description", "Qté", "Unité", "Prix achat",
                                          "Prix vente", "Total vente", ""]):
                     col.markdown(f"<div class='col-head'>{name}</div>", unsafe_allow_html=True)
-
-            # Lignes dynamiques
             for lid in list(ids):
                 c = st.columns([3, 1.1, 1, 1.3, 1.3, 1.5, 0.6])
-                c[0].text_input("Description", key=f"{code}_{lid}_desc",
-                                label_visibility="collapsed",
+                c[0].text_input("Description", key=f"{code}_{lid}_desc", label_visibility="collapsed",
                                 placeholder="Ex : Reprise plâtrerie et enduits…")
-                qte = c[1].number_input("Qté", min_value=0.0, step=1.0,
-                                        key=f"{code}_{lid}_qte", label_visibility="collapsed",
-                                        placeholder="0")
-                c[2].selectbox("Unité", UNITES, key=f"{code}_{lid}_unite",
-                               label_visibility="collapsed")
-                c[3].number_input("Achat", min_value=0.0, step=0.5,
-                                  key=f"{code}_{lid}_achat", label_visibility="collapsed",
-                                  placeholder="0,00")
-                vente = c[4].number_input("Vente", min_value=0.0, step=0.5,
-                                          key=f"{code}_{lid}_vente", label_visibility="collapsed",
-                                          placeholder="0,00")
-                # Total de la ligne (les champs vides valent 0 sans erreur)
+                qte = c[1].number_input("Qté", min_value=0.0, step=1.0, key=f"{code}_{lid}_qte",
+                                        label_visibility="collapsed", placeholder="0")
+                c[2].selectbox("Unité", UNITES, key=f"{code}_{lid}_unite", label_visibility="collapsed")
+                c[3].number_input("Achat", min_value=0.0, step=0.5, key=f"{code}_{lid}_achat",
+                                  label_visibility="collapsed", placeholder="0,00")
+                vente = c[4].number_input("Vente", min_value=0.0, step=0.5, key=f"{code}_{lid}_vente",
+                                          label_visibility="collapsed", placeholder="0,00")
                 ligne_total = (qte or 0) * (vente or 0)
-                c[5].markdown(
-                    f"<div style='padding-top:6px;font-weight:700;color:{NAVY};'>"
-                    f"{format_currency(ligne_total)}</div>", unsafe_allow_html=True)
+                c[5].markdown(f"<div style='padding-top:6px;font-weight:700;color:{NAVY};'>"
+                              f"{format_currency(ligne_total)}</div>", unsafe_allow_html=True)
                 if c[6].button("🗑", key=f"{code}_{lid}_del", help="Supprimer la ligne"):
                     remove_line(code, lid)
                     st.rerun()
-
-            # Bouton d'ajout
-            if st.button(f"➕ Ajouter une ligne", key=f"add_{code}"):
+            if st.button("➕ Ajouter une ligne", key=f"add_{code}"):
                 add_line(code, desc="", unite="m²")
                 st.rerun()
 
     st.divider()
-
-    # Total général live
     rows = collect_lines()
     zc = ZONES[st.session_state["zone_select"]]
     calc = compute(rows, zc, st.session_state["expert_ht"], st.session_state["target_margin"])
@@ -1215,29 +1043,23 @@ def render_step2():
 
 
 # ============================================================================
-# 11. ÉTAPE 3 — GÉNÉRATION & DASHBOARD
+# 14. ÉTAPE 3 — GÉNÉRATION & DASHBOARD
 # ============================================================================
 def render_step3():
     st.subheader("Étape 3 — Génération & tableau de bord")
-
     rows = collect_lines()
 
-    # --- Paramètres d'analyse (impactent le dashboard en temps réel) ---
-    st.markdown("##### 🎯 Paramètres d'analyse")
-    p1, p2 = st.columns(2)
-    with p1:
-        st.number_input("Plafond estimé par l'expert (HT en €) *", min_value=0.0,
-                        step=50.0, key="expert_ht")
-    with p2:
-        st.slider("Objectif de marge commerciale (%)", min_value=10.0, max_value=60.0,
+    with st.container(border=True):
+        st.markdown("##### 🎯 Paramètres d'analyse")
+        p1, p2 = st.columns(2)
+        p1.number_input("Plafond estimé par l'expert (HT en €) *", min_value=0.0, step=50.0, key="expert_ht")
+        p2.slider("Objectif de marge commerciale (%)", min_value=10.0, max_value=60.0,
                   step=0.5, key="target_margin")
 
     zc = ZONES[st.session_state["zone_select"]]
     calc = compute(rows, zc, st.session_state["expert_ht"], st.session_state["target_margin"])
 
-    st.divider()
     st.markdown("### 📈 Dashboard de compatibilité financière")
-
     m1, m2, m3, m4 = st.columns(4)
     m1.markdown(kpi_card("Notre proposition HT", format_currency(calc["final_ht"]),
                          f"TTC : {format_currency(calc['ttc'])}"), unsafe_allow_html=True)
@@ -1249,56 +1071,51 @@ def render_step3():
                          f"Cible : {calc['target_margin']:.0f} %",
                          SUCCESS if calc["margin_pct"] >= calc["target_margin"] else WARNING),
                 unsafe_allow_html=True)
-
     st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
     status_banner(calc)
 
-    # --- Tableau récapitulatif des lignes ---
     if rows:
         st.markdown("##### 📋 Détail du chiffrage retenu")
         st.dataframe(
             [{"Corps de métier": r["corps"], "Description": r["desc"],
-              "Qté": f"{r['qte']:g} {r['unite']}",
-              "PU vente": format_currency(r["vente"]),
+              "Qté": f"{r['qte']:g} {r['unite']}", "PU vente": format_currency(r["vente"]),
               "Total HT": format_currency(r["total_vente"])} for r in rows],
-            width="stretch", hide_index=True,
-        )
+            width="stretch", hide_index=True)
     else:
         st.warning("Aucune ligne chiffrée. Revenez à l'**Étape 2** pour ajouter des travaux.")
 
     st.divider()
-
-    # --- Génération des documents ---
     st.markdown("### 🗂️ Génération du dossier")
-    # Le SIRET n'est PLUS bloquant : seuls les champs réellement indispensables
-    # à un dossier exploitable conditionnent la génération.
-    blocking = (not rows
-                or not st.session_state["client_name"].strip()
-                or not st.session_state["claim_number"].strip()
-                or st.session_state["expert_ht"] <= 0)
 
-    if blocking:
-        st.error("❌ Génération impossible : il faut au moins une ligne chiffrée, "
-                 "un nom d'assuré, un numéro de sinistre et un plafond expert > 0.")
+    # Liste de contrôle claire : on voit EXACTEMENT ce qui manque.
+    checks = [
+        ("Au moins une ligne chiffrée", bool(rows)),
+        ("Nom de l'assuré renseigné", bool(st.session_state["client_name"].strip())),
+        ("Numéro de sinistre renseigné", bool(st.session_state["claim_number"].strip())),
+        ("Plafond expert supérieur à 0 €", st.session_state["expert_ht"] > 0),
+    ]
+    blocking = not all(ok for _, ok in checks)
+    with st.container(border=True):
+        st.markdown("**Conditions de génération**")
+        for label, ok in checks:
+            cls = "ok" if ok else "ko"
+            ic = "✓" if ok else "✗"
+            st.markdown(f"<div class='check {cls}'><span class='ic'>{ic}</span>{label}</div>",
+                        unsafe_allow_html=True)
+        if blocking:
+            st.caption("Astuce : le bouton « ✨ Charger un exemple complet » (menu de gauche) "
+                       "remplit tout instantanément pour tester la génération.")
 
     if st.button("🔥 Générer le dossier complet (3 PDF)", type="primary", disabled=blocking):
-        # Un champ laissé vide reprend son exemple gris (placeholder) pour que
-        # l'en-tête des PDF ne comporte jamais de trou.
-        d = {k: (st.session_state[k].strip() or PLACEHOLDERS.get(k, ""))
-             for k in
-             ("company_name", "company_address", "company_siret", "company_tva",
-              "client_name", "address", "insurance_name", "claim_number",
-              "expert_name", "expert_ref")}
         with st.spinner("Compilation des documents conformes…"):
-            st.session_state.generated = {
-                "fiche": build_fiche_interne(d, rows, calc),
-                "devis": build_devis_conforme(d, rows, calc),
-                "lettre": build_lettre_expert(d, rows, calc),
-                "claim": st.session_state["claim_number"],
-            }
-        st.success("🎉 Les 3 documents ont été générés. Téléchargez-les ci-dessous.")
+            ok = generate_all(rows, calc)
+        if ok:
+            st.toast("Les 3 documents ont été générés.", icon="🎉")
+            st.success("🎉 Dossier généré. Téléchargez vos documents ci-dessous.")
+        else:
+            st.error("Une erreur est survenue pendant la génération. Détail technique ci-dessous.")
+            st.code(st.session_state.gen_error or "Erreur inconnue")
 
-    # --- Zone de téléchargement (persistante après chaque clic) ---
     gen = st.session_state.generated
     if gen:
         st.markdown("##### 📥 Espace de téléchargement")
@@ -1316,12 +1133,13 @@ def render_step3():
 
 
 # ============================================================================
-# 12. ROUTAGE DU WORKFLOW
+# 15. ROUTAGE
 # ============================================================================
-scroll_to_top_if_needed()                       # Défilement en haut après navigation
-
+scroll_to_top_if_needed()
+if st.session_state["nav_step"] not in STEPS:
+    st.session_state["nav_step"] = STEPS[0]
 active_index = STEPS.index(st.session_state["nav_step"])
-render_breadcrumb(active_index)                  # Fil d'Ariane 1 → 2 → 3
+render_breadcrumb(active_index)
 
 if active_index == 0:
     render_step1()
@@ -1330,8 +1148,5 @@ elif active_index == 1:
 else:
     render_step3()
 
-render_nav_buttons(active_index)                 # Boutons Précédent / Suivant
-
-# Sauvegarde automatique de l'état à la fin de CHAQUE exécution : après ce point,
-# toutes les saisies de la passe courante sont dans st.session_state.
+render_nav_buttons(active_index)
 save_session(st.session_state["_sid"])
