@@ -20,7 +20,12 @@ Principes d'implémentation :
 
 import io
 import re
+import os
+import json
+import uuid
+import tempfile
 import datetime
+import unicodedata
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -280,91 +285,117 @@ def _parse_amount(raw):
         return None
 
 
+def _norm_label(s):
+    """Normalise un libelle : sans accents, minuscules, ponctuation -> espaces."""
+    s = unicodedata.normalize("NFD", s or "")
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    s = re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+    return re.sub(r"\s+", " ", s)
+
+
+# Synonymes de libelles rencontres dans les rapports reels. L'ordre des champs
+# compte (on attribue au premier qui correspond) ; au sein d'un champ, placer
+# les variantes les plus specifiques en premier.
+FIELD_SYNONYMS = {
+    "claim_number": ["n de sinistre", "no de sinistre", "numero de sinistre",
+                     "n sinistre", "reference du sinistre", "reference sinistre",
+                     "ref sinistre", "sinistre", "n de dossier", "numero de dossier",
+                     "reference dossier", "ref dossier", "dossier"],
+    "expert_ref": ["reference du rapport", "reference rapport", "ref rapport",
+                   "n de rapport", "numero de rapport", "reference expert",
+                   "ref expert", "reference de l expertise"],
+    "expert_name": ["cabinet d expertise", "cabinet d expert", "cabinet",
+                    "expert missionne", "nom de l expert", "expert"],
+    "insurance_name": ["compagnie d assurance", "compagnie", "assureur", "assurance"],
+    "client_name": ["nom de l assure", "assure", "assuree", "client",
+                    "beneficiaire", "souscripteur"],
+    "address": ["adresse du chantier", "adresse du bien", "adresse du sinistre",
+                "adresse des travaux", "lieu du sinistre", "adresse", "lieu"],
+    "expert_ht": ["montant total ht", "total general ht", "total ht", "montant ht",
+                  "estimation ht", "evaluation ht", "plafond ht", "cout ht"],
+}
+
+
+def _match_field(label_norm):
+    """Renvoie le champ correspondant a un libelle normalise, sinon None."""
+    for field, syns in FIELD_SYNONYMS.items():
+        for syn in syns:
+            if label_norm == syn or label_norm.startswith(syn + " "):
+                return field
+    return None
+
+
 def extract_data_from_pdf(pdf_file):
     """
-    Pré-remplissage automatique : lit le rapport d'expertise (PDF) et tente
-    d'en extraire un maximum de champs (n° sinistre, compagnie, expert,
-    référence, assuré, adresse, plafond HT).
-    Tolérant : retourne uniquement ce qui a pu être trouvé avec confiance.
-    Chaque libellé ci-dessous accepte de nombreuses variantes rencontrées dans
-    les rapports réels (« N° de sinistre », « Réf. dossier », « Cabinet », …).
+    Pre-remplissage automatique fiable. On collecte des paires (libelle, valeur)
+    depuis DEUX sources complementaires :
+        1. les lignes de texte de la forme << Libelle : valeur >>
+        2. les tableaux du PDF (1re cellule = libelle, 2e = valeur)
+    puis on associe chaque libelle a un champ via une liste de synonymes
+    normalises (sans accents, sans ponctuation). Beaucoup plus robuste face a la
+    diversite des mises en page que des expressions regulieres globales.
+    Retourne uniquement les champs trouves avec confiance.
     """
     found = {}
     if not PDFPLUMBER_OK:
         return found
+
+    pairs = []   # liste de (libelle brut, valeur brute)
+    full_text = ""
     try:
         with pdfplumber.open(pdf_file) as pdf:
-            text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+            for page in pdf.pages:
+                txt = page.extract_text() or ""
+                full_text += txt + "\n"
+                # 1) lignes << cle : valeur >>
+                for line in txt.splitlines():
+                    if ":" in line:
+                        label, _, value = line.partition(":")
+                        pairs.append((label, value))
+                # 2) tableaux
+                for table in (page.extract_tables() or []):
+                    for row in table:
+                        cells = [c for c in row if c and str(c).strip()]
+                        if len(cells) >= 2:
+                            pairs.append((cells[0], cells[1]))
     except Exception as exc:
-        st.warning(f"Lecture du PDF impossible : {exc}")
-        return found
+        st.warning(f"Lecture du PDF partielle : {exc}")
 
-    # Normalisation légère pour fiabiliser les expressions régulières
-    text = text.replace("\xa0", " ")
+    full_text = full_text.replace("\xa0", " ")
 
-    def grab(patterns, group=1):
-        """Renvoie la 1re capture non vide parmi une liste de motifs."""
-        for pat in patterns:
-            m = re.search(pat, text, re.IGNORECASE)
-            if m and m.group(group).strip():
-                return m.group(group).strip()
-        return None
+    # --- Association libelle -> champ (on garde la 1re occurrence par champ) ---
+    for raw_label, raw_value in pairs:
+        field = _match_field(_norm_label(raw_label))
+        if not field or field in found:
+            continue
+        value = str(raw_value).replace("\xa0", " ").strip()
+        if not value:
+            continue
+        if field == "expert_ht":
+            amount = _parse_amount(value)
+            if amount and amount > 0:
+                found[field] = amount
+        elif field in ("claim_number", "expert_ref"):
+            m = re.search(r"[A-Za-z0-9][A-Za-z0-9\-/]{3,20}", value)
+            if m:
+                found[field] = m.group(0)
+        else:
+            found[field] = re.split(r"\s{2,}", value)[0].strip()[:60]
 
-    # --- N° de sinistre / dossier (alphanumérique avec tirets) ---
-    claim = grab([
-        r"(?:n[°o]\s*(?:de\s*)?sinistre|sinistre\s*n[°o]?)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-/]{4,20})",
-        r"(?:r[ée]f(?:[ée]rence)?\.?\s*(?:dossier)?|dossier)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-/]{4,20})",
-    ])
-    if claim:
-        found["claim_number"] = claim
+    # --- Filets de securite sur le texte brut si un champ cle manque ---
+    if "expert_ht" not in found:
+        m = re.search(r"(?:total|montant|estimation|plafond)[^\n]{0,30}?HT[\s:]*"
+                      r"([\d][\d\s.]*[.,]\d{2})", full_text, re.IGNORECASE)
+        if m:
+            amount = _parse_amount(m.group(1))
+            if amount and amount > 0:
+                found["expert_ht"] = amount
 
-    # --- Référence du rapport d'expertise ---
-    ref = grab([
-        r"(?:r[ée]f\.?\s*(?:expert|rapport)|n[°o]\s*rapport)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-/]{3,20})",
-    ])
-    if ref:
-        found["expert_ref"] = ref
-
-    # --- Cabinet d'expertise (séparateur obligatoire pour éviter « EXPERTISE ») ---
-    expert = grab([
-        r"(?:cabinet|expert(?:\s*missionn[ée])?)\b\s*[:\-]\s*([A-Za-zÀ-ÿ0-9'’&\.\- ]{4,40})",
-    ])
-    if expert:
-        # On coupe à un éventuel saut de ligne capturé
-        found["expert_name"] = re.split(r"\s{2,}|\n", expert)[0].strip()
-
-    # --- Compagnie d'assurance ---
-    insurer = grab([
-        r"(?:compagnie|assureur|assurance)\b\s*[:\-]\s*([A-Za-zÀ-ÿ0-9'’&\.\- ]{3,40})",
-    ])
-    if insurer:
-        found["insurance_name"] = re.split(r"\s{2,}|\n", insurer)[0].strip()
-
-    # --- Assuré ---
-    client = grab([
-        r"(?:assur[ée]|client|b[ée]n[ée]ficiaire)\b\s*[:\-]\s*([A-Za-zÀ-ÿ0-9'’&\.\- ]{3,40})",
-    ])
-    if client:
-        found["client_name"] = re.split(r"\s{2,}|\n", client)[0].strip()
-
-    # --- Adresse du chantier / du bien ---
-    address = grab([
-        r"(?:adresse\s*(?:du\s*(?:chantier|bien|sinistre))?|lieu\s*du\s*sinistre)\s*[:\-]?\s*"
-        r"([0-9].{6,60}?\d{5}\s+[A-Za-zÀ-ÿ\- ]{2,30})",
-    ])
-    if address:
-        found["address"] = re.split(r"\n", address)[0].strip()
-
-    # --- Plafond / montant HT estimé par l'expert ---
-    raw_amount = grab([
-        r"(?:total|montant|estimation|plafond)\s*(?:g[ée]n[ée]ral\s*)?HT\s*[:\-]?\s*"
-        r"([\d][\d\s. ]*[.,]\d{2})",
-        r"HT\s*[:\-]?\s*([\d][\d\s. ]*[.,]\d{2})\s*€?",
-    ])
-    if raw_amount:
-        amount = _parse_amount(raw_amount)
-        if amount and amount > 0:
-            found["expert_ht"] = amount
+    if "claim_number" not in found:
+        m = re.search(r"sinistre[\s:n0o]*([A-Z]{2,}[0-9][A-Z0-9\-/]{3,18})",
+                      full_text, re.IGNORECASE)
+        if m:
+            found["claim_number"] = m.group(1)
 
     return found
 
@@ -437,6 +468,93 @@ def remove_line(code, lid):
         st.session_state.lots[code].remove(lid)
     for suffix in ("desc", "unite", "qte", "achat", "vente"):
         st.session_state.pop(f"{code}_{lid}_{suffix}", None)
+
+
+# ----------------------------------------------------------------------------
+# 4.c bis — PERSISTANCE (mémoire) : on ne perd plus rien au rafraîchissement
+# ni au retour arrière du navigateur.
+# Principe : un identifiant unique de session est gardé dans l'URL (?sid=…),
+# qui survit au rechargement et aux boutons Précédent/Suivant du navigateur.
+# Tout l'état (champs admin + lignes chiffrées) est sauvegardé dans un petit
+# fichier JSON côté serveur, ré-injecté automatiquement au chargement suivant.
+# ----------------------------------------------------------------------------
+_SESS_DIR = os.path.join(tempfile.gettempdir(), "dossier_assurance_sessions")
+os.makedirs(_SESS_DIR, exist_ok=True)
+
+# Clés « simples » (valeurs scalaires) à mémoriser
+_PERSIST_KEYS = (list(PLACEHOLDERS.keys())
+                 + ["zone_select", "expert_ht", "target_margin", "nav_step",
+                    "pdf_parsed", "pdf_applied"])
+
+
+def _session_path(sid):
+    # Nom de fichier sécurisé (uniquement caractères alphanumériques)
+    safe = re.sub(r"[^A-Za-z0-9]", "", sid)[:40]
+    return os.path.join(_SESS_DIR, f"{safe}.json")
+
+
+def _build_snapshot():
+    """Photographie complète de l'état courant, sérialisable en JSON."""
+    data = {k: st.session_state.get(k) for k in _PERSIST_KEYS}
+    data["lots"] = {code: list(ids) for code, ids in st.session_state.lots.items()}
+    data["line_counter"] = st.session_state.line_counter
+    lines = {}
+    for code, ids in st.session_state.lots.items():
+        for lid in ids:
+            for suf in ("desc", "unite", "qte", "achat", "vente"):
+                key = f"{code}_{lid}_{suf}"
+                if key in st.session_state:
+                    lines[key] = st.session_state[key]
+    data["lines"] = lines
+    return data
+
+
+def save_session(sid):
+    """Écrit l'état courant sur disque (silencieux en cas d'échec)."""
+    try:
+        with open(_session_path(sid), "w", encoding="utf-8") as f:
+            json.dump(_build_snapshot(), f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def restore_session(sid):
+    """Ré-injecte un état précédemment sauvegardé. True si quelque chose restauré."""
+    path = _session_path(sid)
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return False
+    for k in _PERSIST_KEYS:
+        if k in data and data[k] is not None:
+            st.session_state[k] = data[k]
+    if isinstance(data.get("lots"), dict):
+        st.session_state.lots = {code: list(data["lots"].get(code, []))
+                                 for _, code in CORPS_METIER}
+    if isinstance(data.get("line_counter"), int):
+        st.session_state.line_counter = data["line_counter"]
+    for key, val in (data.get("lines") or {}).items():
+        st.session_state[key] = val
+    return True
+
+
+# Récupère (ou crée) l'identifiant de session, persistant dans l'URL.
+_sid = st.query_params.get("sid")
+if not _sid:
+    _sid = uuid.uuid4().hex[:12]
+    st.query_params["sid"] = _sid
+st.session_state["_sid"] = _sid
+
+# Hydratation une seule fois par session Streamlit (donc ré-exécutée après un
+# rafraîchissement, qui crée une nouvelle session côté serveur).
+if not st.session_state.get("_hydrated"):
+    st.session_state["_hydrated"] = True
+    if restore_session(_sid):
+        # État retrouvé : on n'ajoute PAS de ligne vierge supplémentaire.
+        st.session_state.seeded = True
 
 
 # 4.d — Au tout premier lancement : une seule ligne VIERGE pour montrer la
@@ -1173,3 +1291,7 @@ else:
     render_step3()
 
 render_nav_buttons(active_index)                 # Boutons Précédent / Suivant
+
+# Sauvegarde automatique de l'état à la fin de CHAQUE exécution : après ce point,
+# toutes les saisies de la passe courante sont dans st.session_state.
+save_session(st.session_state["_sid"])
